@@ -27,4 +27,5 @@ def benchmark(seq_len=512, head_dim=64):
 
 
 if __name__ == "__main__":
-    benchmark()
+    for seq_len in [128, 256, 512, 1024]:
+        benchmark(seq_len=seq_len)
