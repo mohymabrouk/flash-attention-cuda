@@ -107,3 +107,6 @@ Comparable numerical accuracy
 ```
 
 relative to the baseline implementation.
+
+The manual PyTorch implementation materializes the full N x N attention matrix.
+PyTorch SDPA uses optimized kernels and is expected to be faster and more memory efficient on GPU.
