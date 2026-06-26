@@ -1,8 +1,10 @@
 # Benchmarks
 
-## Baseline Benchmark
+This document reports baseline performance measurements for the reference PyTorch implementation before introducing custom CUDA kernels.
 
-Command:
+---
+
+## Run
 
 ```bash
 python -m benchmarks.bench_attention
@@ -10,103 +12,131 @@ python -m benchmarks.bench_attention
 
 ---
 
-## Current Results
+## Baseline Configuration
 
-| Sequence Length | Latency |
-|----------------|----------|
-| 128 | 0.000666 s |
-| 256 | 0.002878 s |
-| 512 | 0.014200 s |
-| 1024 | 0.058212 s |
+| Parameter | Value |
+|-----------|------:|
+| Device | CPU |
+| Batch Size | 2 |
+| Heads | 8 |
+| Head Dimension | 64 |
+| Warmup Iterations | 10 |
+| Timed Iterations | 100 |
 
 ---
 
-## Observation
+## Results
 
-Latency grows approximately quadratically.
+| Sequence Length | Average Latency (s) |
+|----------------:|--------------------:|
+| 128 | 0.000666 |
+| 256 | 0.002878 |
+| 512 | 0.014200 |
+| 1024 | 0.058212 |
 
-Example:
+---
+
+## Scaling
+
+Latency increases approximately quadratically with sequence length.
+
+| Transition | Increase |
+|------------|---------:|
+| 128 → 256 | ≈ 4× |
+| 256 → 512 | ≈ 5× |
+| 512 → 1024 | ≈ 4× |
+
+This is expected because standard attention has
 
 ```text
-128 → 256 ≈ 4x
-256 → 512 ≈ 5x
-512 → 1024 ≈ 4x
+O(N²D)
 ```
 
-This reflects:
+time complexity and
 
 ```text
 O(N²)
 ```
 
-attention complexity.
+memory complexity.
 
 ---
 
-## Future Benchmark Matrix
+## Current Implementation
 
-### Sequence Lengths
+Implemented methods:
 
-```text
-128
-256
-512
-1024
-2048
-```
+- Manual PyTorch attention
+- PyTorch Scaled Dot Product Attention (SDPA)
 
-### Head Dimensions
+Planned implementations:
 
-```text
-64
-128
-```
-
-### Batch Sizes
-
-```text
-1
-4
-8
-```
-
----
-
-## Methods Compared
-
-```text
-Manual PyTorch Attention
-PyTorch SDPA
-Naive CUDA Attention
-Flash-Style CUDA Attention
-```
+- ⏳ Naive CUDA attention
+- ⏳ FlashAttention tiled CUDA kernel
 
 ---
 
 ## Metrics
 
-Measure:
+The following metrics will be collected for every implementation.
 
-```text
-Latency
-Peak Memory
-Maximum Error
-Throughput
-```
+| Metric | Description |
+|---------|-------------|
+| Latency | Average execution time |
+| Peak GPU Memory | Maximum allocated memory |
+| Throughput | Tokens per second |
+| Maximum Error | Difference from PyTorch SDPA |
 
 ---
 
-## Goal
+## Benchmark Matrix
 
-Demonstrate:
+### Sequence Lengths
+
+- 128
+- 256
+- 512
+- 1024
+- 2048
+- 4096
+
+### Head Dimensions
+
+- 64
+- 128
+
+### Batch Sizes
+
+- 1
+- 2
+- 4
+- 8
+
+---
+
+## Expected Outcome
+
+Compared to the baseline implementation, the FlashAttention kernel should
+
+- reduce GPU memory usage
+- avoid materializing the full attention matrix
+- scale better for long sequence lengths
+- maintain numerical agreement with PyTorch SDPA
+
+---
+
+## Notes
+
+The current baseline implementation explicitly computes
 
 ```text
-Lower memory usage
-Better scaling
-Comparable numerical accuracy
+QKᵀ
+↓
+Softmax
+↓
+PV
 ```
 
-relative to the baseline implementation.
+which requires storing the full attention matrix.
 
-The manual PyTorch implementation materializes the full N x N attention matrix.
-PyTorch SDPA uses optimized kernels and is expected to be faster and more memory efficient on GPU.
+The FlashAttention implementation will instead compute attention block-by-block using shared-memory tiling and online softmax, avoiding the quadratic memory bottleneck.
