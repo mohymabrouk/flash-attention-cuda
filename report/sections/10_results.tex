@@ -1,0 +1,90 @@
+\chapter{Results, Placeholders, and Future Evidence}
+\label{chap:results}
+
+\section{Status of empirical evidence}
+
+This repository is intentionally prepared to host rigorous results without fabricating them. At the time of writing, the authoring environment does not expose the GPU toolchain required to build and run the native extension. Consequently, the report treats all native empirical claims as pending until benchmark artifacts are generated on Kaggle or another recorded CUDA machine.
+
+\begin{resultplaceholder}[No native benchmark artifact in the authoring environment]
+No GPU build, strict CUDA test log, or benchmark JSON produced by the custom CUDA path is available in this checkout at report-authoring time. All native performance, memory, and profiler sections below are therefore templates awaiting a real artifact.
+\end{resultplaceholder}
+
+\section{Environment summary}
+
+When a benchmark JSON is rendered into \texttt{report/generated/environment.tex}, it should identify the exact hardware and software used to obtain the numbers in this chapter.
+
+\IfFileExists{generated/environment.tex}{
+  \input{generated/environment.tex}
+}{
+  \begin{resultplaceholder}[Environment summary pending]
+  Generate \texttt{generated/environment.tex} from the chosen benchmark JSON with
+  \texttt{python -m benchmarks.render\_report\_artifacts}. Do not replace this box by hand.
+  \end{resultplaceholder}
+}
+
+\section{Correctness summary}
+
+The first empirical question is not speed but agreement with the reference. The rendered correctness summary should report the largest observed forward discrepancies across successful benchmark rows and should be interpreted together with the stricter unit-test suite.
+
+\IfFileExists{generated/correctness_summary.tex}{
+  \input{generated/correctness_summary.tex}
+}{
+  \begin{resultplaceholder}[Correctness summary pending]
+  Populate \texttt{generated/correctness\_summary.tex} only from a benchmark JSON whose custom
+  CUDA rows were produced after the strict CUDA test suite passed.
+  \end{resultplaceholder}
+}
+
+\section{Performance comparison}
+
+The performance table should compare the custom CUDA kernel against both PyTorch SDPA and the explicit reference when those baselines are available for the same shapes. The goal is interpretation, not marketing:
+\begin{enumerate}
+  \item speedup over the reference indicates whether fusion and reduced IO help at all;
+  \item comparison with SDPA indicates how far the educational kernel remains from production engineering;
+  \item shape-by-shape variation indicates whether launch overhead or tile reuse dominates.
+\end{enumerate}
+
+\IfFileExists{generated/performance_summary.tex}{
+  \input{generated/performance_summary.tex}
+}{
+  \begin{resultplaceholder}[Performance summary pending]
+  No rendered performance table is present. After a benchmark run, generate this file from the JSON artifact instead of copying values manually into the report.
+  \end{resultplaceholder}
+}
+
+\section{Memory behavior}
+
+Because the project's central algorithmic claim is about avoiding quadratic intermediates, memory evidence is as important as latency evidence. The rendered memory table should therefore be read together with the benchmark methodology that defines ``incremental peak memory'' as the allocator peak beyond already-resident inputs.
+
+\IfFileExists{generated/memory_summary.tex}{
+  \input{generated/memory_summary.tex}
+}{
+  \begin{resultplaceholder}[Memory summary pending]
+  No rendered memory table is present. The eventual artifact should compare methods on the same shape grid and retain unsuccessful or OOM rows elsewhere in the CSV/JSON record.
+  \end{resultplaceholder}
+}
+
+\section{Profiler and sanitizer evidence}
+
+Elapsed time alone does not explain why one kernel is faster or slower. Any claim about occupancy, memory bandwidth, branch divergence, cache behavior, or synchronization overhead should be backed by profiler or sanitizer artifacts.
+
+\IfFileExists{generated/profiling_summary.tex}{
+  \input{generated/profiling_summary.tex}
+}{
+  \begin{resultplaceholder}[Profiling summary pending]
+  No profiler summary has been generated. Before drawing microarchitectural conclusions, attach Nsight Compute and Compute Sanitizer evidence and summarize it in a derived \texttt{generated/profiling\_summary.tex} file.
+  \end{resultplaceholder}
+}
+
+\section{Publication rules for future updates}
+
+When this chapter is updated with real results, the following rules should remain in force:
+\begin{enumerate}
+  \item every table must trace back to a stored benchmark artifact;
+  \item benchmark commands and environment metadata must be preserved;
+  \item failing or unavailable configurations must not be silently removed from the raw artifact;
+  \item the README and this report must be updated together if they make public empirical claims;
+  \item the narrative must distinguish measured observations from causal explanations that still require profiling support.
+\end{enumerate}
+
+This policy is part of the portfolio value of the repository. It shows not only that the code exists, but that the project is prepared to support reproducible, falsifiable claims once the Kaggle run is complete.

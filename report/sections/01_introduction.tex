@@ -1,0 +1,103 @@
+\chapter{Introduction}
+\label{chap:introduction}
+
+\section{Why attention is a systems problem}
+
+The Transformer made scaled dot-product attention a standard computational primitive rather than a specialized modeling technique \citep{vaswani2017attention}. For one attention head, the mathematical definition occupies a single line:
+\begin{equation}
+  O = \softmax\!\left(\alpha QK^{\mathsf T}+M_{\mathrm{mask}}\right)V.
+  \label{eq:intro-attention}
+\end{equation}
+Here $Q\in\R^{N_q\times D}$, $K,V\in\R^{N_k\times D}$, and typically $\alpha=D^{-1/2}$. Equation~\eqref{eq:intro-attention} conceals an implementation choice. One may first write all $N_qN_k$ scores to device memory, read them to compute softmax, write all $N_qN_k$ probabilities, and read them again for the value product. Alternatively, one may change the evaluation order so that only small score blocks exist on chip. Both paths perform the same mathematical function. Their memory traffic and attainable wall time can be very different.
+
+This distinction matters because a GPU is not a uniform arithmetic engine. It is a hierarchy containing a large but relatively distant global-memory space, caches, explicitly managed shared memory, and a small register file associated with each thread. Threads execute in warps and thread blocks; data reuse is effective only when the algorithm and mapping expose it at the appropriate scope. Modern accelerators can issue arithmetic faster than many workloads can feed operands from off-chip memory. Consequently, counting floating-point operations alone does not predict performance. The Roofline model makes this dependence explicit through arithmetic intensity, the ratio of useful work to bytes moved \citep{williams2009roofline}. Transformer-level studies likewise find that data movement is often a decisive optimization target \citep{ivanov2021data}.
+
+\FA{} treats attention as an IO-aware algorithm \citep{dao2022flashattention}. Its central mechanism is not a new approximation to softmax. It is a new schedule for exact attention. Key and value blocks are loaded into fast memory, query rows consume them, and an online normalizer updates the output without requiring the complete row of scores at once. During backward propagation, probabilities can be reconstructed from $Q$, $K$, and a log-normalization statistic instead of being retained as a quadratic activation. The original paper establishes reduced HBM access under an explicit two-level memory model and shows that additional computation can be profitable when it avoids more expensive traffic.
+
+The result is a useful case study in the relationship among algebra, numerical analysis, and parallel programming. A correct implementation must answer all of the following questions:
+\begin{itemize}
+  \item Which compact state is sufficient to merge independently computed score blocks without changing the normalized result?
+  \item How must an existing output numerator be rescaled when a later block contains a larger maximum?
+  \item Which forward statistics make the softmax probabilities recoverable during reverse mode?
+  \item How can gradients for queries, keys, and values be partitioned so that each output element has one writer?
+  \item Where do query, key, value, probability, and gradient fragments reside in the GPU hierarchy at each point?
+  \item Which errors are expected from low-precision inputs and reassociated sums, and which errors indicate a defect?
+  \item How can a benchmark distinguish kernel execution, dispatch overhead, memory allocation, and an optimized framework baseline that may itself select FlashAttention?
+\end{itemize}
+
+This report answers those questions for a deliberately compact native CUDA implementation integrated with PyTorch.
+
+\section{Project objective}
+
+The objective is to implement and explain an exact, differentiable FlashAttention-style operator from first principles. ``From first principles'' does not mean ignoring established work: the attention definition, online-normalizer recurrence, IO-aware schedule, and GPU programming model are cited to their primary or official sources. It means that the project exposes its own forward and backward kernels instead of calling a pre-existing fused attention operator. The result should be small enough that a reader can trace one query row from Python dispatch through CUDA execution and back through the gradient formulas.
+
+The educational objective imposes different priorities from a production library. Production implementations specialize aggressively across architectures, head dimensions, dtypes, masking modes, and workload shapes; use tensor-core matrix instructions; pipeline asynchronous memory movement; and provide mature integration with broader model stacks \citep{dao2024flashattention2,shah2024flashattention3,flashattentionrepo}. This project instead uses scalar CUDA arithmetic, warp reductions, explicit FP32 shared-memory tiles, and a fixed four-warp launch structure. That design leaves performance on the table, but makes the online state, work ownership, and synchronization visible.
+
+\section{Implemented contract}
+\label{sec:intro-contract}
+
+The native extension exposes a forward operation
+\begin{equation*}
+  \texttt{forward}(q,k,v,\texttt{causal},\texttt{scale})\longrightarrow(o,L)
+\end{equation*}
+and a backward operation
+\begin{equation*}
+  \texttt{backward}(d o,q,k,v,o,L,\texttt{causal},\texttt{scale})
+  \longrightarrow(dq,dk,dv).
+\end{equation*}
+The public autograd facade connects these operations into a first-order differentiable PyTorch function. A legacy three-input forward-only entry point remains available for compatibility, but it does not define the full supported interface.
+
+\begin{table}[htbp]
+\centering
+\caption{Implemented feature contract. ``Not supported'' is a deliberate boundary, not an unmeasured claim.}
+\label{tab:feature-contract}
+\begin{tabularx}{\textwidth}{@{}p{0.28\textwidth} p{0.22\textwidth} X@{}}
+\toprule
+Capability & Status & Exact condition \\
+\midrule
+Tensor layout & Supported & contiguous CUDA tensors in $[B,H,N,D]$ order; native code rejects non-contiguous inputs rather than silently copying \\
+Input dtype & Supported & Q, K, and V share FP16, BF16, or FP32 dtype \\
+Head dimension & Supported & $1\leq D\leq256$ and the value dimension equals $D$ \\
+Non-causal attention & Supported & $N_q$ and $N_k$ may differ; batch, head, and head dimension must match \\
+Causal attention & Supported & square self-attention only, $N_q=N_k$; positions $j>i$ are excluded \\
+Forward normalization & Supported & stable online softmax with FP32 state and FP32 saved log-sum-exp \\
+First-order gradients & Supported & gradients with respect to Q, K, and V through a custom backward \\
+Dropout & Not supported & no random keep mask and no dropout scaling \\
+Arbitrary masks/biases & Not supported & no padding mask, additive bias, relative bias, or ALiBi \\
+Grouped/multi-query attention & Not supported & Q, K, and V have the same number of heads \\
+Second-order gradients & Not supported & backward is a terminal native operation, not a differentiable graph of PyTorch primitives \\
+Tensor cores & Not used & dot products are scalar/SIMT reductions; no WMMA/MMA path \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The constrained contract is still broad enough to expose the difficult cases. Sequence lengths and $D$ need not be multiples of the warp width or tile length. Rectangular non-causal attention exercises distinct query and key loop bounds. Causal attention changes the valid domain per query row. Low-precision inputs require careful accumulation. The backward pass must combine a query-major computation for $dQ$ with a key-major computation for $dK$ and $dV$ while recomputing probabilities consistently.
+
+\section{Contributions of the report}
+
+This document makes six concrete contributions to the repository.
+
+First, it supplies a self-contained derivation of online softmax. The scalar normalizer recurrence is lifted to a vector-valued sufficient statistic whose numerator directly accumulates the weighted values. The merge operation is proved correct for arbitrary partitions, not only for the fixed tile size used by the code.
+
+Second, it states the distinction between arithmetic complexity, activation memory, and HBM traffic. FlashAttention-style scheduling does not turn dense exact attention into a linear-time algorithm. It performs $\Theta(N_qN_kD)$ arithmetic while avoiding the $\Theta(N_qN_k)$ score and probability allocations. Under the memory model of \citet{dao2022flashattention}, tiling reduces the asymptotic number of slow-memory accesses over the relevant fast-memory range.
+
+Third, it documents the native execution map precisely: 128 threads, four warps, one output row per warp, a key/value tile of 16, and $128D$ bytes of dynamic FP32 shared memory. It derives index ownership and identifies every block-wide synchronization point. The same reasoning is applied to the query-major and key-major gradient kernels.
+
+Fourth, it derives full first-order reverse mode. The derivation shows why $\delta_i=dO_i\cdot O_i$ equals the probability-weighted sum required by the softmax Jacobian and why storing $L_i=\log\sum_j e^{S_{ij}}$ is sufficient to reconstruct $P_{ij}$.
+
+Fifth, it defines a rigorous validation protocol. The protocol covers reference construction, forced PyTorch SDPA backends, finite-difference spot checks, dtype-specific tolerances, extreme logits, non-multiple tails, rectangular shapes, causal boundaries, invalid inputs, and CUDA memory/race/synchronization checks.
+
+Sixth, it creates an honest empirical template. Results enter through generated files tied to CSV/JSON provenance. A missing artifact produces an orange placeholder, never a fabricated number or an empty plot that might be mistaken for a successful run.
+
+\section{Research questions}
+
+The eventual experiments are organized around four research questions rather than a search for a favorable headline number.
+
+\begin{description}[style=nextline]
+  \item[RQ1: Numerical agreement.] Across supported shapes, dtypes, and causal modes, do forward outputs and first-order gradients agree with a high-confidence PyTorch reference within declared tolerances? How does error change with sequence length, head dimension, and logit magnitude?
+  \item[RQ2: Memory behavior.] Does the implementation avoid allocating an $N_qN_k$ score or probability tensor, and does measured peak allocated memory grow consistently with linear saved state for fixed $B,H,D$?
+  \item[RQ3: Runtime scaling.] At which shapes, if any, does fusion and reduced traffic compensate for scalar arithmetic and launch overhead relative to a manual materialized baseline? How far does the educational kernel remain from PyTorch's optimized fused backend?
+  \item[RQ4: Hardware explanation.] Do profiler counters support the proposed explanation of runtime---for example, memory traffic saved but limited instruction throughput, occupancy, or reduction efficiency? Which resource becomes limiting as $D$ grows?
+\end{description}
+
+These questions allow an unimpressive speed result to remain scientifically useful. A kernel can correctly demonstrate the algorithm while losing to production code. Conversely, a fast number without numerical checks, backend control, or profiler evidence would not establish the intended result.

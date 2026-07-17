@@ -1,0 +1,95 @@
+\chapter{Correctness and Validation Strategy}
+\label{chap:correctness}
+
+\section{Validation goals}
+
+For a custom attention kernel, correctness is not one binary statement. At minimum, three separate claims must be checked:
+\begin{enumerate}
+  \item the Python API enforces the documented contract and dispatches predictably;
+  \item the native forward outputs agree with a trusted reference within justified tolerances;
+  \item the native first-order gradients with respect to Q, K, and V agree with a trusted reference within justified tolerances.
+\end{enumerate}
+The repository's test suite is organized around these claims rather than around file boundaries.
+
+\section{Reference choice}
+
+The explicit reference implementation is intentionally quadratic. It materializes scores and probabilities, accumulates in FP32 for half-precision inputs, and uses ordinary PyTorch operators whose semantics are easy to inspect. This makes it a better pedagogical oracle than comparing the custom kernel only against another fused kernel. The suite also compares the explicit oracle to PyTorch SDPA on CPU to ensure that the reference itself is not silently wrong.
+
+\section{Test layers}
+
+\begin{table}[htbp]
+\centering
+\caption{Automated validation layers currently implemented in the repository.}
+\label{tab:test-layers}
+\begin{tabularx}{\textwidth}{@{}p{0.27\textwidth} p{0.18\textwidth} X@{}}
+\toprule
+Layer & Location & Purpose \\
+\midrule
+Reference/API tests & \texttt{tests/test\_reference.py}, \texttt{tests/test\_public\_api.py} & validate input errors, cross-attention support, causal restrictions, explicit scale handling, non-contiguous Python inputs, and agreement between the explicit oracle and SDPA \\
+CUDA output tests & \texttt{tests/test\_cuda.py} & compare native forward output with the explicit oracle across dtypes, causal modes, tail shapes, and large logits \\
+CUDA gradient tests & \texttt{tests/test\_cuda.py} & compare $dQ$, $dK$, and $dV$ against the explicit oracle for common upstream gradients \\
+Availability gate & \texttt{tests/conftest.py} & turn missing GPU/extension prerequisites into a hard error when \texttt{--require-cuda} is set \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+This split has a practical advantage: most of the repository remains testable on CPU-only machines, while the strict CUDA suite can act as a publication gate on Kaggle.
+
+\section{Shape and dtype coverage}
+
+The CUDA suite deliberately emphasizes awkward boundaries:
+\begin{itemize}
+  \item sequence lengths below, at, and above the tile size of 16;
+  \item head dimensions below, at, and above common warp-friendly values such as 32, 64, 128, and the maximum 256;
+  \item rectangular non-causal cross-attention where $N_q \ne N_k$;
+  \item square causal cases where the valid domain changes row by row;
+  \item FP32, FP16, and BF16 where supported by the runtime.
+\end{itemize}
+
+This emphasis is intentional. Many CUDA bugs hide in tail handling, index arithmetic, and branch conditions rather than in idealized square powers-of-two shapes.
+
+\section{Tolerance policy}
+
+The repository does not demand bitwise identity from the native kernel. Such a demand would be inappropriate because different kernels legitimately reassociate floating-point operations, use different reduction orders, and sometimes invoke different backend instructions \citep{goldberg1991floating,higham2002accuracy,pytorch212numerics}. Instead the tests set dtype-aware tolerances:
+\begin{enumerate}
+  \item tight tolerances for FP32 forward and backward;
+  \item moderately looser tolerances for FP16 due to half-precision output stores and stronger rounding sensitivity;
+  \item looser still for BF16 because its mantissa is shorter than FP16's.
+\end{enumerate}
+The suite also checks that outputs and gradients remain finite on intentionally large-magnitude inputs. Finiteness is a coarse but valuable sanity condition: a numerically stable softmax should not explode into NaNs under the tested cases.
+
+\section{Non-contiguous and stream-sensitive behavior}
+
+The public Python wrapper promises to accept strided tensors by calling \texttt{.contiguous()} before invoking the native operator. That promise is tested explicitly. This is a good example of an interface-level property that matters even though the CUDA kernel itself never sees the original strided layout.
+
+The suite also exercises a non-default CUDA stream. This case targets a specific class of integration bug: launching work on the wrong stream can look correct in a serial test and fail only in a larger asynchronous program. Since PyTorch programs often rely on implicit stream composition, this regression guard is important.
+
+\section{What the current suite does not yet automate}
+
+An honest report must also describe what is absent. The present repository does not yet automate:
+\begin{itemize}
+  \item finite-difference gradient checks for the CUDA kernel;
+  \item large randomized stress tests under Compute Sanitizer;
+  \item long-duration randomized fuzzing across many shape combinations;
+  \item deterministic cross-architecture checks across several GPU generations.
+\end{itemize}
+These omissions do not invalidate the current tests, but they limit the strength of any claim one should make from them. In particular, passing the existing suite is strong evidence of first-order functional correctness, not a proof that no race, OOB access, or architecture-specific corner case remains.
+
+\section{Strict publication gate}
+
+The most important operational feature is the explicit strict flag:
+\begin{lstlisting}[language=bash,caption={Strict CUDA correctness gate.}]
+pytest -m cuda --require-cuda -q
+\end{lstlisting}
+When this flag is present, a missing extension or missing visible GPU is an immediate failure rather than a skipped test session. This prevents a common documentation mistake in GPU projects: a green test run that is green only because the native tests silently never executed.
+
+\section{Interpreting a passing result}
+
+If the strict CUDA suite passes on Kaggle, the following claims become justified:
+\begin{enumerate}
+  \item the custom forward outputs numerically match the explicit oracle on the tested grid;
+  \item the custom first-order gradients numerically match the explicit oracle on the tested grid;
+  \item the public API contract behaves as documented for supported and unsupported cases;
+  \item the implementation runs on PyTorch's current CUDA stream and on non-contiguous wrapper inputs.
+\end{enumerate}
+Nothing more should be inferred automatically. A passing correctness suite does not establish benchmark superiority, optimality, or completeness relative to the production FlashAttention libraries.

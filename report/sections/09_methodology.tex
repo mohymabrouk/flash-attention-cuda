@@ -1,0 +1,132 @@
+\chapter{Experimental Methodology}
+\label{chap:methodology}
+
+\section{Principles}
+
+The benchmark design follows four principles.
+
+\begin{enumerate}
+  \item \textbf{Separate correctness from timing.} Performance numbers are meaningful only after the strict CUDA correctness suite passes.
+  \item \textbf{Record the environment.} GPU model, compute capability, PyTorch version, CUDA version, \texttt{nvcc} availability, and git state are part of the result.
+  \item \textbf{Preserve failures.} Out-of-memory events, unavailable methods, and validation skips are data, not noise to discard.
+  \item \textbf{Report distributions.} A single mean latency hides variability; the benchmark records repeated samples and percentile summaries.
+\end{enumerate}
+
+\section{Measured implementations}
+
+The benchmark can compare up to four implementations behind one public API:
+\begin{enumerate}
+  \item \texttt{cuda}: the custom native extension;
+  \item \texttt{sdpa}: PyTorch scaled-dot-product attention;
+  \item \texttt{reference}: the explicit quadratic oracle;
+  \item \texttt{auto}: wrapper dispatch that chooses native or SDPA based on compatibility.
+\end{enumerate}
+
+For a fair methodological narrative, the most important comparison is not always the most flattering one. The custom kernel should be compared both with the transparent quadratic reference and with PyTorch's optimized fused backend. The former explains whether fusion and streaming help at all; the latter explains how far an educational kernel remains from production engineering.
+
+\section{Shape matrix}
+
+The benchmark treats one run as a Cartesian product over:
+\begin{itemize}
+  \item query lengths;
+  \item optional key lengths;
+  \item head dimensions;
+  \item dtypes;
+  \item causal mode;
+  \item execution mode: forward only or forward-backward.
+\end{itemize}
+
+The CLI now supports
+\begin{lstlisting}[language=bash]
+--causal false
+--causal true
+--causal both
+\end{lstlisting}
+so a single artifact may cover non-causal, causal, or both cases. This is useful for a report because the causal schedule changes the valid work domain and can materially change both runtime and memory behavior.
+
+\section{Timing procedure}
+
+On CUDA devices the benchmark uses CUDA Events around repeated execution. This isolates device-side elapsed time more reliably than a host-side wall clock alone. For CPU execution it falls back to \texttt{time.perf\_counter}. Each configuration follows the same sequence:
+\begin{enumerate}
+  \item allocate and seed inputs;
+  \item optionally build a reference output for error metrics;
+  \item warm up the selected implementation;
+  \item collect repeated timing samples;
+  \item measure incremental peak memory separately;
+  \item serialize both per-row results and environment metadata.
+\end{enumerate}
+
+Warmup matters because the first call may trigger lazy initialization, kernel loading, or cache effects that are not representative of steady-state operation.
+
+\section{Reported metrics}
+
+\begin{table}[htbp]
+\centering
+\caption{Primary benchmark outputs written per successful row.}
+\label{tab:benchmark-metrics}
+\begin{tabularx}{\textwidth}{@{}p{0.28\textwidth} X@{}}
+\toprule
+Metric & Meaning \\
+\midrule
+\texttt{latency\_ms\_p20}, \texttt{median}, \texttt{p80}, \texttt{p95} & latency distribution summary over repeated runs \\
+\texttt{query\_tokens\_per\_second} & $B N_q / \text{seconds}$, intentionally not multiplied by head count \\
+\texttt{dense\_equivalent\_tflops} & simplified FLOP-rate estimate using the dense forward or forward-backward model \\
+\texttt{incremental\_peak\_memory\_bytes} & allocator peak during one operation minus baseline allocation with resident inputs \\
+\texttt{max\_abs\_error}, \texttt{mean\_abs\_error}, \texttt{max\_relative\_error} & numerical deviation from the explicit oracle, when validation is enabled \\
+\texttt{reference\_status} & whether the explicit oracle was run, skipped for size, or failed \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The FLOP-rate figure is explicitly labeled ``dense-equivalent'' because it is a model, not a hardware instruction count. It excludes softmax scalar work, exponentials, control flow, and address arithmetic. Its purpose is comparative interpretation, not hardware billing.
+
+\section{Environment capture}
+
+Every benchmark JSON also stores a metadata block that includes:
+\begin{itemize}
+  \item timestamp and full CLI invocation;
+  \item repository path, git commit, dirty-state marker, and status output;
+  \item Python, PyTorch, and CUDA version strings;
+  \item \texttt{nvcc} location and version when available;
+  \item CUDA device names, compute capabilities, and memory sizes;
+  \item selected environment variables such as \texttt{CUDA\_VISIBLE\_DEVICES}.
+\end{itemize}
+This capture is critical for Kaggle, where the notebook image may change over time and where reinstalling PyTorch is often counterproductive.
+
+\section{Kaggle protocol}
+
+The intended GPU validation environment is a Kaggle notebook with GPU acceleration enabled. The procedural rules are simple but important:
+\begin{enumerate}
+  \item work in \texttt{/kaggle/working}, not read-only \texttt{/kaggle/input};
+  \item inspect the preinstalled PyTorch and CUDA environment before compiling;
+  \item build against Kaggle's stack with \texttt{--no-build-isolation};
+  \item run CPU/API tests first, then the strict CUDA suite;
+  \item preserve the benchmark CSV and JSON artifact before editing the report.
+\end{enumerate}
+
+\begin{reprobox}
+The authoring environment used for this report does not provide a CUDA-capable GPU or \texttt{nvcc}. Therefore this chapter defines the methodology but intentionally does not claim any measured native results.
+\end{reprobox}
+
+\section{From benchmark artifact to report}
+
+Manual transcription of benchmark numbers into a report is error-prone. The repository therefore includes a small renderer:
+\begin{lstlisting}[language=bash,caption={Generating report snippets from one benchmark JSON artifact.}]
+python -m benchmarks.render_report_artifacts \
+  --benchmark-json results/runs/benchmark_<run-id>.json \
+  --output-dir report/generated
+\end{lstlisting}
+The renderer emits optional LaTeX files for environment, correctness, performance, memory, and profiling summaries. The report uses them only if they exist. Otherwise it displays explicit placeholders.
+
+\section{What would constitute convincing evidence}
+
+The report should treat the following bundle as the minimum credible evidence package for a public benchmark claim:
+\begin{enumerate}
+  \item passing strict CUDA correctness test log;
+  \item benchmark CSV and JSON;
+  \item compiler/build log;
+  \item environment summary identifying the GPU and software stack;
+  \item profiler or sanitizer artifacts for any microarchitectural claim beyond raw timing.
+\end{enumerate}
+
+This evidentiary standard is stricter than many small repositories apply, but it is appropriate for a portfolio piece that aims to be both technically serious and honest about what has and has not yet been measured.

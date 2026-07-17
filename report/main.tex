@@ -1,0 +1,139 @@
+\documentclass[11pt,oneside]{report}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage[a4paper,margin=27mm,headheight=14pt]{geometry}
+\usepackage{amsmath,amssymb,amsfonts,mathtools}
+\usepackage{amsthm}
+\usepackage{booktabs,longtable,tabularx,array,multirow}
+\usepackage{enumitem}
+\usepackage[dvipsnames,table]{xcolor}
+\usepackage{graphicx}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,backgrounds,calc,fit,matrix,positioning,shapes.geometric}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usepackage{listings}
+\usepackage[most]{tcolorbox}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{natbib}
+\usepackage{url}
+\usepackage{hyperref}
+\usepackage[nameinlink,noabbrev]{cleveref}
+
+\definecolor{DeepBlue}{HTML}{17365D}
+\definecolor{AccentBlue}{HTML}{2F75B5}
+\definecolor{SoftBlue}{HTML}{EAF2F8}
+\definecolor{DeepGreen}{HTML}{1E6B52}
+\definecolor{SoftGreen}{HTML}{E9F6F1}
+\definecolor{DeepOrange}{HTML}{A94F12}
+\definecolor{SoftOrange}{HTML}{FFF2E8}
+\definecolor{CodeGray}{HTML}{F6F8FA}
+\definecolor{RuleGray}{HTML}{C8D0D9}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=DeepBlue,
+  citecolor=DeepGreen,
+  urlcolor=AccentBlue,
+  pdftitle={An Educational FlashAttention-Style CUDA Operator},
+  pdfauthor={FlashAttention CUDA From Scratch Project}
+}
+
+\lstdefinestyle{projectcode}{
+  backgroundcolor=\color{CodeGray},
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  columns=fullflexible,
+  frame=single,
+  framerule=0.3pt,
+  rulecolor=\color{RuleGray},
+  keywordstyle=\color{DeepBlue}\bfseries,
+  commentstyle=\color{DeepGreen},
+  stringstyle=\color{DeepOrange},
+  showstringspaces=false,
+  tabsize=2
+}
+\lstset{style=projectcode}
+
+\newtheorem{theorem}{Theorem}[chapter]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{invariant}[theorem]{Invariant}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\crefname{theorem}{theorem}{theorems}
+\crefname{lemma}{lemma}{lemmas}
+\crefname{proposition}{proposition}{propositions}
+\crefname{definition}{definition}{definitions}
+\crefname{invariant}{invariant}{invariants}
+
+\newcommand{\FA}{\textsc{FlashAttention}}
+\newcommand{\HBM}{\textsc{HBM}}
+\newcommand{\SRAM}{\textsc{SRAM}}
+\newcommand{\LSE}{\operatorname{LSE}}
+\newcommand{\rowmax}{\operatorname{rowmax}}
+\newcommand{\rowsum}{\operatorname{rowsum}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\softmax}{\operatorname{softmax}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\ceil}[1]{\left\lceil #1 \right\rceil}
+\newcommand{\floor}[1]{\left\lfloor #1 \right\rfloor}
+\newcommand{\placeholdertoken}{\texttt{RESULT\_PENDING}}
+
+\newtcolorbox{scopebox}{
+  colback=SoftBlue,colframe=AccentBlue,boxrule=0.7pt,arc=1.2mm,
+  title=Scope boundary,fonttitle=\bfseries
+}
+\newtcolorbox{resultplaceholder}[1][]{
+  colback=SoftOrange,colframe=DeepOrange,boxrule=0.8pt,arc=1.2mm,
+  title={\placeholdertoken\if\relax\detokenize{#1}\relax\else: #1\fi},fonttitle=\bfseries
+}
+\newtcolorbox{reprobox}{
+  colback=SoftGreen,colframe=DeepGreen,boxrule=0.7pt,arc=1.2mm,
+  title=Reproducibility requirement,fonttitle=\bfseries
+}
+
+\setcounter{secnumdepth}{3}
+\setcounter{tocdepth}{2}
+\setlength{\parindent}{1.2em}
+\setlength{\parskip}{0.25em}
+\setlist{nosep,leftmargin=*}
+\captionsetup{font=small,labelfont=bf}
+
+\begin{document}
+
+\input{sections/00_frontmatter}
+\tableofcontents
+\listoffigures
+\listoftables
+
+\input{sections/01_introduction}
+\input{sections/02_background}
+\input{sections/03_online_softmax}
+\input{sections/04_flash_attention}
+\input{sections/05_cuda_design}
+\input{sections/06_implementation}
+\input{sections/07_backward}
+\input{sections/08_correctness}
+\input{sections/09_methodology}
+\input{sections/10_results}
+\input{sections/11_discussion}
+\input{sections/12_limitations}
+\input{sections/13_conclusion}
+
+\appendix
+\input{sections/appendix_derivations}
+\input{sections/appendix_reproducibility}
+\input{sections/appendix_result_schema}
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}

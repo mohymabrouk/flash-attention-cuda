@@ -1,0 +1,89 @@
+\chapter{Benchmark and Report Artifact Schema}
+\label{app:result-schema}
+
+\section{Benchmark JSON structure}
+
+The benchmark harness writes a JSON object with two top-level keys:
+\begin{lstlisting}[language=Python,caption={Conceptual benchmark JSON schema.}]
+{
+  "schema_version": 1,
+  "metadata": { ... },
+  "results": [
+    { ... one benchmark row ... },
+    ...
+  ]
+}
+\end{lstlisting}
+
+\paragraph{Metadata block.}
+The \texttt{metadata} object records run-level information such as timestamp, command line, git state, software versions, CUDA device properties, and benchmark CLI configuration.
+
+\paragraph{Results block.}
+Each entry in \texttt{results} corresponds to one method-shape-dtype-causality configuration. Rows preserve both success and failure states. This is important: a report may summarize only successful rows, but the raw artifact should retain OOMs, unavailable methods, and invalid configurations.
+
+\section{Representative row fields}
+
+\begin{longtable}{@{}p{0.30\textwidth} p{0.16\textwidth} p{0.46\textwidth}@{}}
+\caption{Representative fields in one benchmark result row.}
+\label{tab:result-row-fields}\\
+\toprule
+Field & Example type & Meaning \\
+\midrule
+\endfirsthead
+\toprule
+Field & Example type & Meaning \\
+\midrule
+\endhead
+\texttt{status} & string & \texttt{ok}, \texttt{error}, \texttt{oom}, \texttt{unavailable}, or \texttt{invalid\_configuration} \\
+\texttt{method} & string & \texttt{cuda}, \texttt{sdpa}, \texttt{reference}, or \texttt{auto} \\
+\texttt{dtype} & string & input tensor dtype name \\
+\texttt{query\_length}, \texttt{key\_length}, \texttt{head\_dim} & integers & problem shape parameters \\
+\texttt{causal} & boolean & causal or non-causal mode \\
+\texttt{mode} & string & \texttt{forward} or \texttt{forward-backward} \\
+\texttt{latency\_ms\_median} & float or null & median timing sample for successful rows \\
+\texttt{dense\_equivalent\_tflops} & float or null & simplified FLOP-rate estimate \\
+\texttt{incremental\_peak\_memory\_mib} & float or null & incremental allocator peak in MiB \\
+\texttt{max\_abs\_error} & float or null & maximum absolute forward error versus the reference \\
+\texttt{reference\_status} & string & whether reference validation ran, was skipped, or failed \\
+\texttt{error} & string or null & exception text for unsuccessful rows \\
+\bottomrule
+\end{longtable}
+
+\section{Rendered report snippets}
+
+The helper script \texttt{benchmarks/render\_report\_artifacts.py} derives the following optional files from one benchmark JSON artifact:
+\begin{itemize}
+  \item \texttt{report/generated/environment.tex}
+  \item \texttt{report/generated/correctness\_summary.tex}
+  \item \texttt{report/generated/performance\_summary.tex}
+  \item \texttt{report/generated/memory\_summary.tex}
+  \item \texttt{report/generated/profiling\_summary.tex}
+\end{itemize}
+
+Each generated file should:
+\begin{enumerate}
+  \item state the source benchmark artifact path;
+  \item contain only derived information from that artifact;
+  \item remain safe to delete and regenerate;
+  \item never become the sole location of a result that is absent from the raw JSON.
+\end{enumerate}
+
+\section{Expected workflow}
+
+\begin{lstlisting}[language=bash,caption={Result-to-report workflow.}]
+python -m benchmarks.bench_attention \
+  --device cuda --methods cuda sdpa reference \
+  --seq-lens 128 512 1024 --head-dims 64 --dtypes float16 --causal both \
+  --output-dir results/runs --require-cuda
+
+python -m benchmarks.render_report_artifacts \
+  --benchmark-json results/runs/benchmark_<run-id>.json \
+  --output-dir report/generated
+
+cd report
+latexmk -pdf main.tex
+\end{lstlisting}
+
+\section{Why a schema appendix belongs in the report}
+
+This appendix may seem unusual for a course-style report, but it is valuable for a systems portfolio project. The point is to make the evidence pipeline inspectable. Another reader should be able to trace a table in Chapter~\ref{chap:results} back to a concrete JSON artifact and then back to the exact benchmark command that produced it.

@@ -1,0 +1,88 @@
+\chapter{Reproducibility Checklist}
+\label{app:reproducibility}
+
+\section{Kaggle execution checklist}
+
+\begin{enumerate}
+  \item Enable a GPU accelerator in the Kaggle notebook settings.
+  \item Clone or copy the repository into \texttt{/kaggle/working}.
+  \item Inspect the preinstalled environment:
+\begin{lstlisting}[language=bash]
+python - <<'PY'
+import torch
+from torch.utils.cpp_extension import CUDA_HOME
+print("torch:", torch.__version__)
+print("torch CUDA:", torch.version.cuda)
+print("CUDA available:", torch.cuda.is_available())
+print("CUDA_HOME:", CUDA_HOME)
+if torch.cuda.is_available():
+    print("GPU:", torch.cuda.get_device_name(0))
+    print("capability:", torch.cuda.get_device_capability(0))
+PY
+nvcc --version
+\end{lstlisting}
+  \item Install the repository without replacing Kaggle's PyTorch stack:
+\begin{lstlisting}[language=bash]
+MAX_JOBS=2 python -m pip install -r requirements.txt
+MAX_JOBS=2 python -m pip install -v -e . --no-build-isolation
+\end{lstlisting}
+  \item Run the portable tests:
+\begin{lstlisting}[language=bash]
+pytest -m "not cuda" -q
+\end{lstlisting}
+  \item Run the strict native gate:
+\begin{lstlisting}[language=bash]
+pytest -m cuda --require-cuda -q
+\end{lstlisting}
+  \item Launch the chosen benchmark sweep and preserve the CSV/JSON artifacts.
+  \item Render report snippets from the chosen JSON artifact:
+\begin{lstlisting}[language=bash]
+python -m benchmarks.render_report_artifacts \
+  --benchmark-json results/runs/benchmark_<run-id>.json \
+  --output-dir report/generated
+\end{lstlisting}
+  \item Rebuild the report and archive the resulting PDF with the raw artifacts.
+\end{enumerate}
+
+\section{Suggested artifact bundle}
+
+For a defensible release or portfolio submission, archive the following together:
+\begin{itemize}
+  \item benchmark CSV and JSON files;
+  \item strict CUDA pytest log;
+  \item \texttt{pip install} build log;
+  \item PDF report and any generated report snippets;
+  \item optional profiler output such as \texttt{.ncu-rep} or sanitizer logs.
+\end{itemize}
+
+\section{Recommended sanitizer and profiler commands}
+
+These commands are not run in the current authoring environment, but they are the intended next diagnostic step on a CUDA machine:
+\begin{lstlisting}[language=bash,caption={Examples for deeper validation on a CUDA host.}]
+compute-sanitizer --tool memcheck \
+  python -m pytest -m cuda --require-cuda -q
+
+compute-sanitizer --tool racecheck \
+  python -m pytest -m cuda --require-cuda -q
+
+ncu --set full --target-processes all \
+  python -m benchmarks.bench_attention \
+    --device cuda --methods cuda sdpa reference \
+    --seq-lens 512 1024 --head-dims 64 --dtypes float16 --causal both
+\end{lstlisting}
+
+\section{Worktree and provenance policy}
+
+The benchmark metadata records whether the repository was dirty at run time. This does not prohibit running benchmarks on an uncommitted worktree, but it does mean that any public claim should retain the exact worktree state or commit used to generate the result. In practice, that means either committing the tested state or preserving a patch alongside the benchmark artifact.
+
+\section{Report update policy}
+
+When replacing placeholders in Chapter~\ref{chap:results}, follow this order:
+\begin{enumerate}
+  \item generate or select the benchmark JSON artifact;
+  \item render LaTeX snippets from that artifact;
+  \item rebuild the PDF and check that the source artifact path appears in the rendered tables;
+  \item only then edit surrounding prose to interpret the new evidence.
+\end{enumerate}
+
+This order ensures that the narrative grows out of the stored measurement rather than the other way around.

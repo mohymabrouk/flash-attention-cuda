@@ -1,0 +1,114 @@
+\chapter{Repository Implementation and Software Interface}
+\label{chap:implementation}
+
+\section{Why software structure matters}
+
+A CUDA kernel alone is not a usable portfolio project. To evaluate and trust the operator, the repository also needs a public Python API, explicit validation behavior, benchmark tooling, packaging that behaves correctly on Kaggle, and documentation that distinguishes observed evidence from future work. This chapter documents those pieces because they determine whether the kernel can be reproduced and critiqued by another reader.
+
+\section{Layered repository design}
+
+The project is organized into four software layers.
+
+\begin{enumerate}
+  \item \textbf{Reference layer.} The module \texttt{flash\_attention\_cuda/reference.py} implements an explicit PyTorch oracle and a PyTorch SDPA wrapper. These functions define the correctness contract independently of the native code.
+  \item \textbf{Autograd/dispatch layer.} The module \texttt{flash\_attention\_cuda/attention.py} validates inputs, chooses the requested implementation, and wraps the native extension in a custom \texttt{torch.autograd.Function}.
+  \item \textbf{Native boundary layer.} The file \texttt{src/attention\_cuda.cpp} exposes the C++ binding, performs native input checks, and launches CUDA code through PyTorch's extension interface \citep{pytorch212extension}.
+  \item \textbf{Kernel layer.} The file \texttt{src/attention\_kernel.cu} contains the forward, delta, $dQ$, and combined $dK$/$dV$ kernels.
+\end{enumerate}
+
+This separation is intentional. It allows the project to remain usable even on a machine without \texttt{nvcc}: the Python oracles and most tests still work, while the native path fails with an explicit message rather than a vague import error.
+
+\section{Public Python API}
+
+The public entry point is conceptually
+\begin{lstlisting}[language=Python,caption={Public API shape.}]
+flash_attention(
+    q, k, v,
+    causal=False,
+    softmax_scale=None,
+    implementation="auto",
+)
+\end{lstlisting}
+
+The wrapper serves three roles.
+
+\paragraph{Input validation.}
+The same high-level contract applies to all implementations: 4D tensors in $[B,H,N,D]$ order, shared device and floating dtype, matched batch/head dimensions, equal K/V sequence length, equal head dimension, and non-zero sequence/head sizes. Causal mode additionally requires $N_q=N_k$.
+
+\paragraph{Dispatch policy.}
+The string \texttt{implementation} selects among four behaviors:
+\begin{itemize}
+  \item \texttt{"reference"} uses the explicit quadratic PyTorch oracle;
+  \item \texttt{"sdpa"} calls \texttt{torch.nn.functional.scaled\_dot\_product\_attention};
+  \item \texttt{"cuda"} requires the compiled extension and the native kernel contract;
+  \item \texttt{"auto"} uses the native kernel when possible and falls back to SDPA otherwise.
+\end{itemize}
+This design is pedagogically useful because it exposes both a slow, transparent oracle and a realistic framework baseline through one stable interface.
+
+\paragraph{Autograd integration.}
+The custom \texttt{torch.autograd.Function} stores the forward inputs, output, and row log-sum-exp tensor and invokes the native backward when gradients are requested. The backward is marked once-differentiable because the repository does not claim second-order gradient support.
+
+\section{Reference implementations}
+
+The explicit oracle materializes the score matrix and probability matrix using ordinary PyTorch operations:
+\begin{equation}
+  S = \alpha QK^{\mathsf T}, \qquad
+  P = \softmax(S), \qquad
+  O = PV.
+\end{equation}
+For FP16 and BF16 inputs, the oracle accumulates in FP32 before casting back to the input dtype. This makes it a stronger numerical baseline for the custom kernel than a naive same-dtype implementation would be. The SDPA wrapper uses PyTorch's built-in attention operator with the same logical contract, which provides a modern framework comparison point \citep{pytorch212sdpa}.
+
+\section{Native binding contract}
+
+The C++ extension is the narrowest trusted interface to the CUDA code. It performs checks that are specific to the native implementation:
+\begin{itemize}
+  \item all tensors must be CUDA tensors;
+  \item all tensors must be contiguous and strided;
+  \item dtype must be FP16, BF16, or FP32;
+  \item $1 \le D \le 256$;
+  \item saved output and LSE tensors in backward must match the expected shapes;
+  \item the scale must be finite and representable in FP32.
+\end{itemize}
+The point of these checks is not merely user convenience. They establish assumptions that the CUDA kernels depend on for correct indexing and memory access. Catching a violation in C++ with a readable error is dramatically safer than letting it reach device code.
+
+\section{Packaging and Kaggle build behavior}
+
+The project uses a standard PyTorch extension build via \texttt{setuptools}. The key packaging decision is that Kaggle builds should run with
+\begin{lstlisting}[language=bash,caption={Kaggle build command.}]
+MAX_JOBS=2 python -m pip install -v -e . --no-build-isolation
+\end{lstlisting}
+so that the extension compiles against Kaggle's already-installed PyTorch and CUDA stack rather than pulling a mismatched wheel set. The build script also supports a reference-only CPU path through the environment variable
+\begin{lstlisting}[language=bash]
+FLASH_ATTENTION_SKIP_CUDA_BUILD=1
+\end{lstlisting}
+which disables native compilation entirely. That feature is useful for documentation work and CPU-side correctness tests in environments like the current authoring workspace.
+
+\section{Benchmark and artifact pipeline}
+
+The benchmark CLI in \texttt{benchmarks/bench\_attention.py} measures forward or forward-backward execution across a grid of shapes, dtypes, methods, and causal modes. It records:
+\begin{itemize}
+  \item per-repeat latency samples and percentile summaries;
+  \item query-token throughput and a dense-equivalent TFLOP/s estimate;
+  \item incremental peak allocator memory on CUDA;
+  \item numerical error against the explicit oracle, when enabled;
+  \item environment metadata including command line, timestamps, git state, software versions, and GPU properties.
+\end{itemize}
+
+The repository also includes \texttt{benchmarks/render\_report\_artifacts.py}, which converts one benchmark JSON file into optional LaTeX snippets under \texttt{report/generated/}. This keeps the long-form report tied to a machine-readable artifact rather than manual copy-paste.
+
+\section{Local continuity files}
+
+Two local-only files, \texttt{context.md} and \texttt{how\_\_to\_run.md}, are intentionally ignored by Git. They exist to help a single working checkout remember the intended Kaggle workflow and report-generation steps without turning that ephemeral guidance into the public repository narrative. The public source of truth remains the README, the benchmark code, and the report.
+
+\section{Why the interface is part of the technical contribution}
+
+For a systems portfolio project, software boundary design is part of the contribution rather than an afterthought.
+
+\begin{enumerate}
+  \item It makes unsupported cases explicit instead of silently falling back in ways that could hide evaluation mistakes.
+  \item It allows CPU-only reasoning and documentation work to continue even when a GPU is unavailable.
+  \item It separates correctness oracles from the code under test, which prevents circular validation.
+  \item It turns future benchmark numbers into reproducible artifacts that can be checked independently of the prose.
+\end{enumerate}
+
+This chapter therefore complements the kernel design: the CUDA code explains how the operator works, while the software structure explains how one can build, invoke, verify, and report it responsibly.

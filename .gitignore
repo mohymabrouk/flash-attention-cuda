@@ -1,7 +1,63 @@
+# Python environments and caches
 .venv/
+venv/
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 *.egg-info/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
 .ipynb_checkpoints/
+
+# Native/Python build products
+build/
+dist/
+*.so
+*.dylib
+*.dll
+*.o
+*.obj
+*.a
+*.lib
+*.ptx
+*.cubin
+.ninja_deps
+.ninja_log
+compile_commands.json
+
+# Benchmark and profiler run artifacts (curated summaries may still be tracked)
+results/runs/
+results/generated/
+*.nsys-rep
+*.ncu-rep
+
+# LaTeX products
+report/build/
+report/generated/
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.lof
+*.log
+*.lot
+*.out
+*.run.xml
+*.synctex.gz
+*.toc
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Private local handoff/run notes requested for this workspace. The public
+# README contains the portable instructions that belong in the repository.
+context.md
+how__to_run.md

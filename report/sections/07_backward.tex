@@ -1,0 +1,142 @@
+\chapter{Backward Pass by Recomputation}
+\label{chap:backward}
+
+\section{Why the backward pass is the hard part}
+
+Forward exact attention can be streamed with the online state $(m_i,\ell_i,A_i)$. Backward propagation is more subtle because the derivative of softmax couples all keys in a row. A naive implementation would save the full probability matrix $P$ or the full score matrix $S$ so that reverse mode can reuse them later. Doing so would immediately reintroduce the quadratic memory cost that the forward pass was designed to avoid.
+
+FlashAttention's solution is to save only the row log-sum-exp statistic $L_i$ and recompute probabilities on demand \citep{dao2022flashattention}. This section derives the required gradients and explains how the repository maps them onto two atomics-free CUDA kernels.
+
+\section{Reverse-mode equations}
+
+Let $G = \partial \mathcal L / \partial O$ be the upstream derivative of a scalar loss with respect to the attention output. For one row $i$,
+\begin{equation}
+  O_i = \sum_j p_{ij} v_j,
+  \qquad
+  p_{ij} = e^{s_{ij}-L_i}.
+\end{equation}
+The derivative with respect to the probabilities is
+\begin{equation}
+  \frac{\partial \mathcal L}{\partial p_{ij}}
+  = G_i v_j^{\mathsf T}.
+  \label{eq:grad-p}
+\end{equation}
+The softmax Jacobian yields
+\begin{equation}
+  \frac{\partial \mathcal L}{\partial s_{ij}}
+  = p_{ij}
+    \left(
+      \frac{\partial \mathcal L}{\partial p_{ij}}
+      - \sum_t p_{it}\frac{\partial \mathcal L}{\partial p_{it}}
+    \right).
+\end{equation}
+Define the row scalar
+\begin{equation}
+  \delta_i = G_i O_i^{\mathsf T}.
+  \label{eq:delta-def}
+\end{equation}
+Because $O_i = \sum_t p_{it} v_t$,
+\begin{equation}
+  \delta_i
+  = \sum_t p_{it} (G_i v_t^{\mathsf T})
+  = \sum_t p_{it} \frac{\partial \mathcal L}{\partial p_{it}}.
+\end{equation}
+Hence
+\begin{equation}
+  dS_{ij}
+  := \frac{\partial \mathcal L}{\partial s_{ij}}
+  = p_{ij} \left(G_i v_j^{\mathsf T} - \delta_i\right).
+  \label{eq:ds}
+\end{equation}
+Once $dS$ is known, the remaining matrix derivatives are ordinary products:
+\begin{align}
+  dQ &= \alpha\, dS K, \\
+  dK &= \alpha\, dS^{\mathsf T} Q, \\
+  dV &= P^{\mathsf T} G.
+  \label{eq:dqdkdv}
+\end{align}
+
+\section{Reconstructing probabilities}
+
+The forward pass saves $L_i = \log \sum_j e^{s_{ij}}$. This is enough to reconstruct each probability without storing $P$:
+\begin{equation}
+  p_{ij} = e^{s_{ij}-L_i}.
+\end{equation}
+The backward pass therefore reuses the original Q, K, and V tensors, recomputes the required dot products, and evaluates \eqref{eq:ds} on the fly. The extra arithmetic is the explicit price paid to avoid quadratic saved state.
+
+\section{Delta prepass}
+
+Equation \eqref{eq:delta-def} suggests a small preparatory kernel. One warp owns one query row and reduces
+\begin{equation}
+  \delta_i = \sum_{r=0}^{D-1} G_{ir} O_{ir}.
+\end{equation}
+The output is a compact FP32 tensor of shape $[B,H,N_q]$. This tensor is cheap to store and is reused by both the $dQ$ kernel and the combined $dK$/$dV$ kernel.
+
+The prepass is worth separating because it simplifies the two main gradient kernels. Each main kernel can then treat $\delta_i$ as already available rather than repeatedly contracting $G_i$ with $O_i$ for every tile.
+
+\section{Query-major kernel for \texorpdfstring{$dQ$}{dQ}}
+
+The $dQ$ kernel mirrors the forward ownership pattern. Each warp owns one query-gradient row and streams over key/value tiles. For a valid pair $(i,j)$ it computes:
+\begin{align}
+  p_{ij} &= e^{\alpha q_i k_j^{\mathsf T} - L_i}, \\
+  dP_{ij} &= G_i v_j^{\mathsf T}, \\
+  dS_{ij} &= p_{ij}(dP_{ij} - \delta_i), \\
+  dQ_i &\mathrel{+}= \alpha\, dS_{ij} k_j.
+\end{align}
+This mapping has an important structural property: one warp is the only writer of row $dQ_i$. Therefore no atomic update is required.
+
+\section{Key-major kernel for \texorpdfstring{$dK$}{dK} and \texorpdfstring{$dV$}{dV}}
+
+The remaining gradients are more naturally grouped by key row. If the repository attempted to compute $dK$ and $dV$ inside the query-major kernel, many query warps would need to contribute to the same key-gradient row, forcing atomics or an additional reduction buffer. Instead, the code launches a second kernel in which each warp owns one key row $j$ and streams through tiles of query rows and upstream gradients.
+
+For each valid pair $(i,j)$ the owning key warp evaluates
+\begin{align}
+  p_{ij} &= e^{\alpha q_i k_j^{\mathsf T} - L_i}, \\
+  dP_{ij} &= G_i v_j^{\mathsf T}, \\
+  dS_{ij} &= p_{ij}(dP_{ij} - \delta_i), \\
+  dK_j &\mathrel{+}= \alpha\, dS_{ij} q_i, \\
+  dV_j &\mathrel{+}= p_{ij} G_i.
+\end{align}
+Again the ownership rule ensures a single writer for each output row.
+
+\begin{proposition}[Single-writer gradient partition]
+In the repository's backward design, every element of $dQ$, $dK$, and $dV$ is written by exactly one warp during its owning kernel.
+\end{proposition}
+
+\begin{proof}
+The $dQ$ kernel assigns each query row $i$ to exactly one warp in exactly one block-group traversal, and only that warp updates row $dQ_i$. The key-major kernel assigns each key row $j$ to exactly one warp in exactly one block-group traversal, and only that warp updates rows $dK_j$ and $dV_j$. Since the three outputs are partitioned by row and never shared across kernels, no output element has multiple writers.
+\end{proof}
+
+\section{Causal handling in backward}
+
+The causal mask applies to backward exactly where it applies to forward: only pairs with $j\le i$ contribute. The kernels implement this by skipping invalid query-key pairs during recomputation. This preserves exactness because masked probabilities are identically zero and therefore contribute nothing to \eqref{eq:ds} or \eqref{eq:dqdkdv}.
+
+\section{Cost model of recomputation}
+
+Recomputation changes the practical runtime profile. The backward pass performs extra dot products because each relevant score is effectively revisited in both the $dQ$ and key-major kernels. In dense non-causal attention the usual forward-backward FLOP estimate is
+\begin{equation}
+  F_{\text{fwd+bwd}} \approx 12BHN_qN_kD,
+\end{equation}
+three times the simplified forward estimate. This figure remains an approximation because it excludes exponentials, comparisons, reductions, casts, and index arithmetic. It nevertheless captures the main idea: backward is more computationally intense than forward, but it avoids a much larger activation footprint.
+
+\section{Numerical considerations}
+
+Backward shares the same floating-point themes as forward:
+\begin{itemize}
+  \item probabilities are reconstructed from a difference of two potentially large quantities, $\alpha q_i k_j^{\mathsf T}$ and $L_i$;
+  \item the row contraction $\delta_i$ is a reduction and therefore order sensitive;
+  \item $dQ$, $dK$, and $dV$ each accumulate many contributions.
+\end{itemize}
+The repository keeps dot products, reconstructed probabilities, delta values, and gradient accumulators in FP32 and casts only at the final store. This does not remove rounding error, but it keeps the numerical behavior aligned with the project's educational and validation goals.
+
+\section{Why the backward design is portfolio-worthy}
+
+Many simplified attention projects stop at a forward kernel because the backward path is where memory efficiency, numerical reasoning, and parallel ownership interact most sharply. This repository instead implements the complete first-order story:
+\begin{enumerate}
+  \item the forward pass saves only the compact state needed for backward;
+  \item backward reconstructs probabilities rather than storing them;
+  \item the gradient outputs are partitioned to avoid atomics;
+  \item the public autograd wrapper exposes the operator as a trainable PyTorch function.
+\end{enumerate}
+
+For a research or systems portfolio, that end-to-end differentiable path matters. It demonstrates not only that the algorithm can be derived, but that it can be integrated into the software conventions of modern deep-learning tooling.

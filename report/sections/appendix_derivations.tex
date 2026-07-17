@@ -1,0 +1,70 @@
+\chapter{Additional Derivations}
+\label{app:derivations}
+
+\section{Merging two processed key sets}
+
+Let $J_1$ and $J_2$ be disjoint processed key sets for one query row. Define
+\begin{align}
+  m_a &= \max_{j\in J_a} s_{ij}, \\
+  \ell_a &= \sum_{j\in J_a} e^{s_{ij}-m_a}, \\
+  A_a &= \sum_{j\in J_a} e^{s_{ij}-m_a} v_j,
+\end{align}
+for $a\in\{1,2\}$. Let $m = \max(m_1,m_2)$. Then the merged state is
+\begin{align}
+  \ell &= e^{m_1-m}\ell_1 + e^{m_2-m}\ell_2, \\
+  A &= e^{m_1-m}A_1 + e^{m_2-m}A_2.
+\end{align}
+This follows from the same change-of-reference argument used in the online recurrence. It shows that tiles may be processed independently and merged later so long as their state uses the same sufficient statistics.
+
+\section{Softmax Jacobian contraction}
+
+For one row $p = \softmax(s)$, the Jacobian is
+\begin{equation}
+  \frac{\partial p_j}{\partial s_t} = p_j(\delta_{jt} - p_t),
+\end{equation}
+where $\delta_{jt}$ is the Kronecker delta. Let $g_j = \partial \mathcal L/\partial p_j$. Then
+\begin{align}
+  \frac{\partial \mathcal L}{\partial s_t}
+  &= \sum_j g_j \frac{\partial p_j}{\partial s_t} \\
+  &= \sum_j g_j p_j (\delta_{jt} - p_t) \\
+  &= g_t p_t - p_t \sum_j g_j p_j \\
+  &= p_t \left(g_t - \sum_j g_j p_j\right).
+\end{align}
+In attention, $g_t = G_i v_t^{\mathsf T}$ and the weighted sum becomes $G_i O_i^{\mathsf T}$, which is exactly the scalar $\delta_i$ used by the implementation.
+
+\section{Causal work count}
+
+For square causal attention with sequence length $N$, the number of valid $(i,j)$ pairs is
+\begin{equation}
+  \sum_{i=1}^{N} i = \frac{N(N+1)}{2}.
+\end{equation}
+Relative to the dense non-causal case of $N^2$ pairs, the leading ratio tends to one half as $N$ grows:
+\begin{equation}
+  \frac{N(N+1)/2}{N^2} = \frac{1}{2} + \frac{1}{2N}.
+\end{equation}
+Finite-size tile boundaries and control flow prevent real runtimes from following this ratio exactly, but it remains a useful leading-order intuition.
+
+\section{Shared-memory footprint}
+
+The forward and gradient kernels stage two FP32 tiles of height $B_c=16$ and width $D$:
+\begin{equation}
+  2 \times 16 \times D \times 4 \text{ bytes} = 128D \text{ bytes}.
+\end{equation}
+At $D=64$, $128$, and $256$, this gives 8 KiB, 16 KiB, and 32 KiB respectively. This linear dependence on $D$ is one reason the current native contract stops at $D=256$.
+
+\section{Dense-equivalent FLOP model}
+
+The report uses the common simplified count that treats one multiply-add as two FLOPs.
+
+\paragraph{Forward.}
+The score product $QK^{\mathsf T}$ costs approximately $2N_qN_kD$ FLOPs and the value product $PV$ costs another $2N_qN_kD$, giving
+\begin{equation}
+  F_{\text{fwd}} \approx 4BHN_qN_kD.
+\end{equation}
+
+\paragraph{Backward.}
+The gradient products for $dQ$, $dK$, and $dV$ contribute the same leading order again, and recomputation adds another score-like pass. The benchmark therefore uses
+\begin{equation}
+  F_{\text{fwd+bwd}} \approx 12BHN_qN_kD
+\end{equation}
+as a dense-equivalent estimate. This is a deliberately simple model rather than a complete instruction count.

@@ -1,0 +1,127 @@
+\chapter{Background: Attention and the GPU Memory Hierarchy}
+\label{chap:background}
+
+\section{Scaled dot-product attention}
+
+For a single batch element and attention head, let the $i$th query, $j$th key, and $j$th value be row vectors $q_i,k_j,v_j\in\R^D$. The unmasked score is
+\begin{equation}
+  s_{ij}=\alpha\,q_i k_j^{\mathsf T}
+  =\alpha\sum_{d=0}^{D-1}q_{id}k_{jd}.
+  \label{eq:score}
+\end{equation}
+For a valid-index set $\mathcal V_i\subseteq\{0,\ldots,N_k-1\}$, rowwise probabilities and output are
+\begin{align}
+  p_{ij} &=
+  \begin{cases}
+    \displaystyle\frac{e^{s_{ij}}}{\sum_{t\in\mathcal V_i}e^{s_{it}}},&j\in\mathcal V_i,\\[2mm]
+    0,&j\notin\mathcal V_i,
+  \end{cases}
+  \label{eq:probability}\\
+  o_i &= \sum_{j\in\mathcal V_i}p_{ij}v_j.
+  \label{eq:output-row}
+\end{align}
+Non-causal attention uses $\mathcal V_i=\{0,\ldots,N_k-1\}$ and therefore permits $N_q\neq N_k$. Square causal self-attention uses $N_q=N_k=N$ and $\mathcal V_i=\{0,\ldots,i\}$. This report treats masking as a change in the summation domain. The equivalent dense convention assigns $s_{ij}=-\infty$ outside $\mathcal V_i$.
+
+The usual scale $\alpha=D^{-1/2}$ controls score magnitude. Suppose, only for this variance argument, that components of $q_i$ and $k_j$ are independent, zero mean, and unit variance. The unscaled dot product is a sum of $D$ zero-mean products, each with unit variance, so
+\begin{equation}
+  \operatorname{Var}\!\left(\sum_{d=0}^{D-1}q_{id}k_{jd}\right)=D.
+\end{equation}
+Multiplication by $D^{-1/2}$ returns the variance to one. Without scaling, increasing $D$ tends to push softmax farther into saturation, where one entry dominates and derivatives through most entries become small. This argument motivates a default, but the native API accepts an explicit positive scale so a caller can reproduce another attention convention.
+
+With batch and heads restored, each $(b,h)$ slice is independent:
+\begin{equation}
+  Q,K,V\in\R^{B\times H\times N\times D}.
+\end{equation}
+The implementation exploits that independence in the grid geometry. It does not implement grouped-query attention, in which query heads outnumber key/value heads and a key/value slice is shared across several query heads.
+
+\section{Materialized evaluation}
+
+A conventional decomposition contains three logical stages:
+\begin{equation}
+  S=\alpha QK^{\mathsf T},\qquad P=\softmax(S),\qquad O=PV.
+  \label{eq:three-stages}
+\end{equation}
+Calling optimized matrix multiplication for the first and third stages can provide excellent compute throughput. The decomposition nevertheless creates a systems cost: $S$ and $P$ each contain $N_qN_k$ elements per batch-head pair. If both are materialized in an element type of $w$ bytes, their payload alone is
+\begin{equation}
+  \operatorname{bytes}(S,P)=2wBHN_qN_k.
+  \label{eq:sp-bytes}
+\end{equation}
+At $B=2$, $H=16$, $N_q=N_k=4096$, and two-byte storage, this expression is 2~GiB, before Q/K/V/O, allocator overhead, workspace, gradients, or other model activations. An actual framework may fuse or avoid some intermediates, so \eqref{eq:sp-bytes} describes the explicit materialized algorithm rather than every call to a high-level API.
+
+The leading arithmetic count is also quadratic. Treating a fused multiply-add as two floating-point operations, the score product and value product each cost approximately $2N_qN_kD$ operations per head, giving
+\begin{equation}
+  F_{\mathrm{fwd}}\approx 4BHN_qN_kD
+  \label{eq:forward-flops}
+\end{equation}
+plus lower-order exponentials, reductions, masking, and rescaling. Causal attention visits approximately half the square score domain, although boundary and diagonal tiles prevent an exact factor of two for finite $N$. Tiled exact attention changes neither the dense non-causal asymptotic arithmetic order nor the mathematical output.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=7mm and 9mm,
+  box/.style={draw,rounded corners,minimum width=24mm,minimum height=9mm,align=center},
+  arr/.style={-{Latex[length=2.5mm]},thick}
+]
+  \node[box,fill=SoftBlue] (q) {$Q$};
+  \node[box,fill=SoftGreen,right=of q] (k) {$K^{\mathsf T}$};
+  \node[box,fill=SoftOrange,right=of k] (s) {$S$\\$N_q\times N_k$};
+  \node[box,fill=SoftOrange,right=of s] (p) {$P$\\$N_q\times N_k$};
+  \node[box,fill=SoftGreen,right=of p] (v) {$V$};
+  \node[box,fill=SoftBlue,right=of v] (o) {$O$};
+  \draw[arr] (q) -- (k);
+  \draw[arr] (k) -- node[above,font=\scriptsize] {GEMM} (s);
+  \draw[arr] (s) -- node[above,font=\scriptsize] {softmax} (p);
+  \draw[arr] (p) -- (v);
+  \draw[arr] (v) -- node[above,font=\scriptsize] {GEMM} (o);
+  \begin{scope}[on background layer]
+    \node[draw=DeepOrange,dashed,rounded corners,fit=(s)(p),inner sep=3mm,label=below:{\small quadratic intermediates}] {};
+  \end{scope}
+\end{tikzpicture}
+\caption{Logical dataflow of materialized attention. The drawing denotes data dependence, not a claim that a particular PyTorch backend necessarily creates both intermediates.}
+\label{fig:materialized}
+\end{figure}
+
+\section{A two-level view of GPU memory}
+
+IO-aware analysis abstracts a complex GPU into a large slow memory and a small fast memory. In the terminology used by \citet{dao2022flashattention}, HBM is the large off-chip level and SRAM is the small on-chip level. Actual NVIDIA hardware has more levels and scopes: device global memory, L2, an SM-local L1/shared-memory complex, and per-thread registers. The CUDA programming model exposes thread blocks that cooperate through shared memory and barriers, while threads within a warp execute in SIMT groups and can exchange values with shuffle instructions \citep{nvidia2026programming,nickolls2008cuda}.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  level/.style={draw,rounded corners,minimum height=10mm,align=center},
+  arrow/.style={<->,>=Latex,thick,DeepBlue}
+]
+  \node[level,fill=SoftOrange,minimum width=13cm] (global) {Device global memory / HBM-like off-chip memory\\\small large capacity, visible to all blocks, highest data-movement cost};
+  \node[level,fill=SoftBlue,minimum width=10.8cm,above=10mm of global] (l2) {L2 cache\\\small device-wide and hardware managed};
+  \node[level,fill=SoftGreen,minimum width=8.6cm,above=10mm of l2] (shared) {SM-local L1 and shared memory\\\small shared memory is explicitly staged per block};
+  \node[level,fill=white,minimum width=6.2cm,above=10mm of shared] (reg) {Registers\\\small private per thread; fastest and smallest};
+  \draw[arrow] (global) -- node[right,font=\small]{cache lines / memory transactions} (l2);
+  \draw[arrow] (l2) -- node[right,font=\small]{loads and stores} (shared);
+  \draw[arrow] (shared) -- node[right,font=\small]{thread cooperation} (reg);
+  \node[align=left,right=9mm of shared,font=\small] {explicit tiling\\and barriers};
+  \node[align=left,right=9mm of reg,font=\small] {distributed\\accumulators};
+\end{tikzpicture}
+\caption{Original schematic of the memory scopes relevant to this implementation. Physical sizes and bandwidths depend on the GPU and must be captured from the actual experiment rather than assumed from a paper's device.}
+\label{fig:hierarchy}
+\end{figure}
+
+The word ``fast'' is contextual. Registers avoid explicit shared-memory instructions, but excessive per-thread register demand can reduce the number of resident warps or spill into local memory, which resides off chip. Shared memory offers low-latency reuse within a block, but bank conflicts and barriers can serialize progress. Global accesses can achieve high bandwidth when a warp addresses contiguous segments, yet inefficient access patterns transfer unused bytes. NVIDIA therefore recommends coalescing global accesses and using shared memory for data reuse when the reuse offsets staging and synchronization costs \citep{nvidia2026bestpractices}.
+
+The implementation's fixed mapping creates all three trade-offs. A warp distributes the $D$ components of one query and one output accumulator across 32 lanes. Larger $D$ increases registers per thread because each lane owns several output elements. Key and value tiles are converted to FP32 in shared memory, so the per-block footprint grows linearly with $D$. Four query rows share each staged key/value tile, providing reuse but also requiring every warp to reach the same block-wide barriers, even when a tail query row is inactive.
+
+\section{Arithmetic intensity and fusion}
+
+For a kernel with $F$ relevant operations and $T$ bytes transferred at a chosen memory level, arithmetic intensity is $I=F/T$. A simplified Roofline bound is
+\begin{equation}
+  \operatorname{performance}\leq\min(P_{\max},\,I\beta_{\max}),
+  \label{eq:roofline}
+\end{equation}
+where $P_{\max}$ is peak arithmetic throughput and $\beta_{\max}$ is peak bandwidth at that level \citep{williams2009roofline}. The bound is diagnostic, not a promise that either ceiling will be reached. Instruction mix, dependencies, occupancy, reductions, divergence, and launch overhead can leave a kernel below both ceilings.
+
+Fusion improves intensity when an intermediate can remain on chip instead of being written and reread. Attention is a particularly strong opportunity because the score and probability matrices are much larger than the rowwise statistics needed to normalize them. The obstacle is softmax: every probability in a row depends on the denominator over the complete row. The next chapter shows that this global dependency can be summarized by a maximum and rescaled sum, enabling exact blockwise evaluation.
+
+\section{Exact memory efficiency is distinct from approximate attention}
+
+Many efficient-attention methods change the mathematical problem using sparsity, low-rank structure, kernels, or restricted receptive fields. Such methods can reduce arithmetic complexity, but may change model behavior. Memory-efficient exact attention takes a different route. \citet{rabe2021selfattention} demonstrate that quadratic storage is not mathematically necessary even while time remains quadratic. \FA{} adds explicit IO analysis and a GPU schedule that exploits tiling and recomputation \citep{dao2022flashattention}.
+
+The distinction prevents two common misstatements. First, exact FlashAttention is not ``linear-time attention.'' Dense non-causal forward work remains $\Theta(N_qN_kD)$. Second, ``linear memory'' refers to avoiding quadratic intermediates; it does not mean constant total memory. Q, K, V, O, the saved log-normalizers, gradients, and temporary row statistics all scale with sequence length. This report reports each category separately rather than using one undifferentiated memory-complexity label.

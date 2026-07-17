@@ -1,0 +1,4 @@
+include LICENSE
+include README.md
+recursive-include src *.cpp *.cu *.h
+recursive-include report *.tex *.bib *.md

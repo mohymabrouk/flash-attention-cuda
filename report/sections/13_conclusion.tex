@@ -1,0 +1,10 @@
+\chapter{Conclusion}
+\label{chap:conclusion}
+
+This report has developed an educational FlashAttention-style CUDA operator from first principles. The project begins with the exact scaled dot-product attention equation, rewrites it through an online softmax invariant, maps that invariant onto a tiled CUDA schedule, and extends the same design into a first-order backward pass based on recomputation rather than quadratic saved state.
+
+The resulting repository is more than a kernel demo. It exposes a usable PyTorch interface, explicit native-contract checks, correctness oracles, a strict CUDA test gate, a benchmark harness with environment capture, and a LaTeX report template that refuses to invent results. That combination is what makes the project portfolio-ready: the code, the math, the tests, and the reporting discipline all reinforce each other.
+
+Future Kaggle runs will determine the empirical standing of the implementation relative to a transparent quadratic baseline and to PyTorch's optimized SDPA path. Whatever those numbers turn out to be, the repository is now structured to interpret them honestly. If the custom kernel wins on some shapes, the result will illustrate the power of IO-aware fusion. If it loses, the gap will still illuminate why production attention kernels require the deeper optimization techniques explored by FlashAttention-2 and FlashAttention-3.
+
+Either way, the core lesson remains: efficient GPU programming is not only about counting arithmetic operations. It is about choosing what to store, what to recompute, and where each piece of data should live while the computation unfolds. FlashAttention makes that lesson unusually concrete, and this repository turns it into an inspectable end-to-end implementation.

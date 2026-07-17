@@ -1,0 +1,67 @@
+\chapter{Limitations and Honest Boundaries}
+\label{chap:limitations}
+
+\section{Native feature limits}
+
+\begin{table}[htbp]
+\centering
+\caption{Current limitations of the native implementation and why they matter.}
+\label{tab:limitations}
+\begin{tabularx}{\textwidth}{@{}p{0.26\textwidth} p{0.22\textwidth} X@{}}
+\toprule
+Limitation & Status & Consequence \\
+\midrule
+Head dimension cap & $D \le 256$ & keeps register and shared-memory usage simple, but excludes larger heads \\
+No dropout & unsupported & not a drop-in training replacement for general Transformer workloads \\
+No arbitrary mask or bias & unsupported & no padding masks, additive biases, ALiBi, or custom sparsity patterns \\
+No GQA/MQA & unsupported & Q, K, and V must have the same head count \\
+No second-order gradients & unsupported & backward is sufficient for ordinary training but not higher-order differentiation \\
+No tensor-core path & omitted by design & likely leaves substantial performance on the table \\
+Fixed tile sizes & fixed at compile time & easy to analyze, but not tuned per architecture or workload \\
+Authoring environment has no GPU & currently true & empirical claims must wait for Kaggle or another CUDA machine \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Validation limits}
+
+The present tests are strong enough to support first-order correctness claims on the exercised grid, but they are not exhaustive. In particular:
+\begin{itemize}
+  \item a passing suite does not rule out all race conditions or OOB accesses;
+  \item the suite does not yet cover every possible GPU architecture or driver stack;
+  \item numerical tolerance checks are necessary but cannot prove ideal conditioning;
+  \item benchmark-based memory measurements rely on allocator statistics rather than a complete device-memory trace.
+\end{itemize}
+
+\section{Performance interpretation limits}
+
+Any future performance discussion in this repository must respect three caveats.
+
+\paragraph{First,} a dense-equivalent TFLOP/s estimate is not a true instruction-throughput metric. It is a convenient normalization based on the mathematical work model.
+
+\paragraph{Second,} benchmark results on Kaggle's GPU should not be generalized automatically to other architectures. Shared-memory capacity, tensor-core behavior, cache geometry, and compiler quality all matter.
+
+\paragraph{Third,} comparison with PyTorch SDPA is comparison with a moving target. PyTorch may route to math, efficient, cuDNN, or FlashAttention-like backends depending on version, dtype, mask, and hardware \citep{pytorch212sdpa}. That is why the benchmark records backend-related metadata and allows explicit SDPA-backend forcing.
+
+\section{Scientific scope}
+
+This project should be read as a serious implementation study, not as a claim to state-of-the-art attention performance. Its main scientific scope is narrower and more defensible:
+\begin{enumerate}
+  \item demonstrate the exact online-softmax algorithm in code;
+  \item implement the corresponding first-order backward pass;
+  \item expose the operator through a modern PyTorch extension interface;
+  \item define a reproducible benchmark and reporting workflow.
+\end{enumerate}
+
+\section{Future work}
+
+Natural next steps are clear:
+\begin{itemize}
+  \item tune tile sizes by head dimension and architecture;
+  \item add vectorized loads and tensor-core kernels;
+  \item support dropout, masks, and head-count asymmetry;
+  \item add profiler-driven optimization and sanitization passes;
+  \item automate more report generation directly from benchmark and profiler artifacts.
+\end{itemize}
+
+The value of the current repository is that those directions are now grounded in a complete, understandable baseline rather than in an unexplained black box.

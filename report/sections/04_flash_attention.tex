@@ -1,0 +1,113 @@
+\chapter{FlashAttention as an IO-Aware Schedule}
+\label{chap:flash}
+
+\section{Two notions of efficiency}
+
+Attention kernels are often described as ``efficient'' without specifying which resource is being reduced. For dense exact attention there are at least three distinct questions:
+\begin{enumerate}
+  \item How many arithmetic operations are performed?
+  \item How much auxiliary memory is allocated?
+  \item How many bytes are transferred through the expensive levels of the memory hierarchy?
+\end{enumerate}
+Materialized attention and FlashAttention-style attention have the same leading arithmetic order, $\Theta(N_qN_kD)$, for dense non-causal problems. What changes is the second and third item. The tiled algorithm avoids storing the full score and probability matrices and instead revisits inputs while keeping only compact row statistics and on-chip tiles \citep{dao2022flashattention,rabe2021selfattention}.
+
+\section{The two-level memory model}
+
+\citet{dao2022flashattention} formalize this optimization using a two-level model inspired by classic IO-complexity analysis \citep{aggarwal1988io}. A large slow memory holds the inputs and outputs, while a smaller fast memory of capacity $M$ elements holds blocks that are actively reused. On an NVIDIA GPU the physical hierarchy is richer than this abstraction, but the model still captures the dominant design decision: it is cheaper to reuse data that has already been staged on chip than to materialize and revisit a large intermediate in HBM.
+
+For attention, the materialized route effectively performs
+\begin{equation}
+  (Q,K) \to S, \qquad S \to P, \qquad (P,V) \to O.
+\end{equation}
+Even if an implementation fuses some adjacent steps, a score-like or probability-like object with $N_qN_k$ elements is the natural intermediate. FlashAttention instead transforms the schedule into a sequence of tile updates:
+\begin{equation}
+  (Q_i, K_{t:t+B_c}, V_{t:t+B_c}, m_i, \ell_i, A_i)
+  \longrightarrow
+  (m_i', \ell_i', A_i').
+\end{equation}
+The full score matrix is never committed to global memory.
+
+\section{Algorithm sketch}
+
+At the algorithmic level, exact tiled attention can be summarized as follows.
+
+\begin{enumerate}
+  \item Partition the key and value matrices into row tiles of height $B_c$.
+  \item Partition the query matrix into row tiles of height $B_r$.
+  \item For one query tile, initialize online state $(m_i,\ell_i,A_i)$ for each query row.
+  \item For every key/value tile:
+  \begin{enumerate}
+    \item load the tile into fast memory;
+    \item compute local query-key scores for the tile;
+    \item update the online statistics and value numerators;
+    \item discard the score tile after use.
+  \end{enumerate}
+  \item Normalize each output row at the end.
+\end{enumerate}
+
+This algorithm is exact because the online state is a sufficient statistic for the processed keys. It is memory efficient because the transient object has size $B_r B_c$ rather than $N_q N_k$.
+
+\begin{table}[htbp]
+\centering
+\caption{Qualitative comparison between three attention evaluation strategies.}
+\label{tab:attention-strategies}
+\begin{tabularx}{\textwidth}{@{}p{0.25\textwidth} p{0.18\textwidth} p{0.2\textwidth} X@{}}
+\toprule
+Strategy & Arithmetic order & Quadratic intermediate & Main trade-off \\
+\midrule
+Materialized exact attention & $\Theta(N_qN_kD)$ & yes & simplest conceptual decomposition but heavy memory traffic \\
+FlashAttention-style exact attention & $\Theta(N_qN_kD)$ & no & more control flow and recomputation in exchange for lower IO \\
+Approximate efficient attention & varies by method & often no & changes the mathematical operator to reduce work or storage \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Why the schedule matters on GPUs}
+
+The GPU is a bandwidth- and latency-sensitive machine. Registers and shared memory provide fast reuse but have small capacity. Global memory is large but expensive to traverse repeatedly. The Roofline model summarizes the tension:
+\begin{equation}
+  \text{attainable throughput} \le \min(P_{\max}, I \beta_{\max}),
+\end{equation}
+where $I$ is arithmetic intensity and $\beta_{\max}$ is peak bandwidth at the chosen memory level \citep{williams2009roofline}. If an algorithm writes and rereads a huge intermediate, its arithmetic intensity at the HBM boundary may be far below what the arithmetic units could otherwise sustain.
+
+FlashAttention increases effective intensity by fusing multiple logical stages around the on-chip tile. The score exists briefly inside the kernel, contributes immediately to the denominator and value numerator, and is then discarded. This is why the method is best interpreted as a schedule transformation rather than a new algebraic layer.
+
+\section{From the abstract schedule to this repository}
+
+The custom kernel in this repository fixes $B_r=4$ and $B_c=16$. Those values are not claimed to be optimal. They are chosen because they fit naturally into one 128-thread block with four warps and because they keep shared-memory usage easy to analyze:
+\begin{equation}
+  \text{shared bytes per block}
+  = 2 \times B_c \times D \times \texttt{sizeof(float)}
+  = 128D.
+\end{equation}
+At the maximum supported head dimension $D=256$, the block uses 32 KiB of dynamic shared memory, which fits under a common 48 KiB default limit.
+
+The fixed tiling gives the project a concrete pedagogical advantage. One may directly connect each theoretical quantity to a code location:
+\begin{itemize}
+  \item $m_i$ and $\ell_i$ are lane-zero scalars in a warp;
+  \item $A_i$ is distributed across warp lanes as per-dimension register slices;
+  \item $K$ and $V$ tiles reside in FP32 shared memory;
+  \item the output row and saved log-sum-exp are written once after all tiles are consumed.
+\end{itemize}
+
+\section{Exactness, recomputation, and training}
+
+The IO-aware perspective continues into backward propagation. A naive autograd decomposition would save probabilities or scores so they are available to the gradient kernels. That saves arithmetic but restores quadratic state. FlashAttention instead stores a rowwise summary---the log-sum-exp statistic---and recomputes probabilities when gradients are needed \citep{dao2022flashattention}. The trade-off is explicit:
+\begin{equation}
+  \text{more dot products and exponentials}
+  \quad \Longleftrightarrow \quad
+  \text{far less saved activation state}.
+\end{equation}
+On accelerators where memory traffic is the limiting resource, this can be favorable. On a small educational kernel that does not use tensor cores, the balance may be less dramatic, but the algorithmic principle is the same.
+
+\section{What the method does not claim}
+
+Three negative statements are as important as the positive ones.
+
+\begin{enumerate}
+  \item \FA{} is not linear-time dense attention. Dense non-causal arithmetic remains quadratic in sequence length.
+  \item \FA{} is not inherently approximate. In real arithmetic it computes the same operator as materialized attention.
+  \item \FA{} does not guarantee a speedup for every implementation. A poor tile shape, missing tensor-core path, or insufficient occupancy can still make a specific kernel slower than a mature framework backend.
+\end{enumerate}
+
+These cautions matter for an educational portfolio project. A faithful implementation of the idea may be scientifically successful even if the final benchmark shows that PyTorch SDPA remains faster on Kaggle's GPU. The purpose of the experiments is to measure that gap honestly and explain it, not to assume the outcome in advance.

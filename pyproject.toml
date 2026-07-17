@@ -1,12 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel", "torch>=2.1"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "flash-attention-cuda"
-version = "0.1.0"
+version = "0.2.0"
+description = "An educational, from-scratch FlashAttention-style CUDA implementation"
+readme = "README.md"
 requires-python = ">=3.10"
-dependencies = [
-    "torch",
-    "pytest",
+license = { file = "LICENSE" }
+keywords = ["attention", "cuda", "flash-attention", "pytorch", "transformers"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = ["torch>=2.1"]
+
+[project.optional-dependencies]
+dev = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "pytest>=8.0",
 ]
 
-[tool.pytest.ini_options]
-pythonpath = ["."]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["flash_attention_cuda*", "src*"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra"
+markers = [
+    "cuda: requires a CUDA device and the compiled extension",
+    "slow: longer-running correctness or benchmark-style test",
+]

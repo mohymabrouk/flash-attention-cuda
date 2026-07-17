@@ -1,0 +1,70 @@
+\chapter{Discussion}
+\label{chap:discussion}
+
+\section{What this project demonstrates already}
+
+Even before benchmark results are filled in, the repository demonstrates several nontrivial technical outcomes.
+
+\begin{enumerate}
+  \item Exact attention can be implemented without materializing the score or probability matrix.
+  \item The online-normalization recurrence can be carried all the way into a working CUDA kernel with saved LSE statistics.
+  \item The backward pass can be expressed through recomputation and single-writer ownership rather than through quadratic saved state or atomics.
+  \item A small PyTorch extension can expose this behavior behind a clean, tested Python API.
+\end{enumerate}
+
+Those are substantive systems outcomes independent of whether the final Kaggle benchmark beats PyTorch SDPA.
+
+\section{Why an educational kernel may still lose to production code}
+
+If future results show that the custom kernel is slower than PyTorch SDPA or the production FlashAttention libraries, that would not be surprising. The production stack benefits from optimizations deliberately omitted here:
+\begin{itemize}
+  \item tensor-core matrix instructions and architecture-specific scheduling;
+  \item more aggressive tiling and work partitioning \citep{dao2024flashattention2};
+  \item asynchronous pipelines and low-precision techniques \citep{shah2024flashattention3};
+  \item broader kernel specialization by head dimension, dtype, and mask type;
+  \item substantial tuning effort across GPU generations.
+\end{itemize}
+
+The educational kernel instead spends resources on inspectability: FP32 shared tiles, scalar arithmetic, fixed tile sizes, and direct expression of the online invariant.
+
+\section{What a positive result would mean}
+
+Suppose a future benchmark shows that the custom kernel outperforms the explicit reference for moderate or long sequences while still lagging SDPA. That would support a focused conclusion:
+\begin{quote}
+The repository successfully demonstrates the algorithmic value of IO-aware fusion and recomputation, while also illustrating the performance gap between a readable teaching implementation and a highly optimized production kernel.
+\end{quote}
+This is a strong portfolio outcome because it connects theory, implementation, and honest measurement.
+
+\section{What a negative result would still teach}
+
+Suppose instead that the custom kernel fails to outperform even the explicit materialized baseline on Kaggle. That would still be informative. It would suggest that one or more of the following dominates on the tested hardware:
+\begin{enumerate}
+  \item launch overhead for small or moderate sequence lengths;
+  \item insufficient occupancy due to registers or shared memory;
+  \item scalar arithmetic that cannot exploit tensor-core throughput;
+  \item extra backward recomputation that outweighs the saved memory traffic for the tested shapes;
+  \item benchmark baselines that already use highly optimized fused paths.
+\end{enumerate}
+Such a result would motivate targeted profiling and help explain why production FlashAttention evolved toward more specialized designs.
+
+\section{Relationship to the broader literature}
+
+The repository sits at an intersection of three threads in the literature:
+\begin{enumerate}
+  \item the Transformer attention formulation of \citet{vaswani2017attention};
+  \item memory-efficient exact attention ideas such as \citet{rabe2021selfattention};
+  \item IO-aware GPU scheduling and modern FlashAttention kernels \citep{dao2022flashattention,dao2024flashattention2,shah2024flashattention3}.
+\end{enumerate}
+Its contribution is not a new asymptotic result. It is a compact end-to-end realization that makes the central ideas inspectable and reproducible in a single repository.
+
+\section{Portfolio perspective}
+
+From a hiring or research-portfolio perspective, the most impressive part of a project like this is rarely a raw TFLOP/s number in isolation. What stands out is the ability to:
+\begin{itemize}
+  \item derive the math carefully;
+  \item map it into CUDA execution and memory scopes;
+  \item integrate it with a real deep-learning runtime;
+  \item test it rigorously;
+  \item document limitations and evidence policy honestly.
+\end{itemize}
+That is the standard this report is designed to support.

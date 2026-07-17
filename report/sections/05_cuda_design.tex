@@ -1,0 +1,131 @@
+\chapter{CUDA Kernel Design}
+\label{chap:cuda-design}
+
+\section{Mapping one attention problem to the grid}
+
+After flattening batch and head indices, each independent attention problem consists of
+\begin{equation}
+  Q \in \R^{N_q \times D}, \qquad K,V \in \R^{N_k \times D}.
+\end{equation}
+The native forward kernel groups four query rows into one thread block. With a 32-thread warp size and four warps per block,
+\begin{equation}
+  \text{threads per block} = 4 \times 32 = 128.
+\end{equation}
+Warp $w\in\{0,1,2,3\}$ owns query row $i = i_0 + w$ within the current query group. This ownership model gives each output row one writer and keeps synchronization simple: all four warps cooperate on the shared-memory loads, but only the owning warp updates the output state for its row.
+
+\begin{table}[htbp]
+\centering
+\caption{Static design parameters of the native CUDA kernels.}
+\label{tab:cuda-static-parameters}
+\begin{tabular}{@{}l c l@{}}
+\toprule
+Parameter & Value & Purpose \\
+\midrule
+Warp size & 32 & lane-level SIMD/SIMT execution unit \\
+Warps per block & 4 & four owned rows per block \\
+Threads per block & 128 & cooperative shared-memory loading and warp arithmetic \\
+Key/value tile height $B_c$ & 16 & shared-memory reuse granularity \\
+Values per lane & 8 & covers $D \le 8\times 32 = 256$ \\
+Index type & 64-bit & safe flattened addressing \\
+Shared tile dtype & FP32 & numerically stable accumulation and reuse \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Per-lane data ownership}
+
+Within a row-owning warp, lane $\ell$ is responsible for dimensions
+\begin{equation}
+  \ell,\ \ell+32,\ \ell+64,\ \ldots
+\end{equation}
+until the head dimension $D$ is exhausted. Since the project supports $D\le256$, each lane owns at most eight elements of the query row, output numerator, or gradient accumulator. This lane-strided layout has two practical advantages:
+\begin{enumerate}
+  \item it handles arbitrary tails without special vector-width cases;
+  \item it keeps the warp-wide reduction surface small, because only scalar dot products need to be reduced across lanes.
+\end{enumerate}
+
+The cost is that the kernel does not use vectorized half loads or tensor-core matrix instructions. The design therefore prioritizes readability and correctness over peak throughput.
+
+\section{Forward shared-memory staging}
+
+Each block allocates two dynamic shared arrays:
+\begin{equation}
+  \texttt{shared\_k}[B_c \times D],
+  \qquad
+  \texttt{shared\_v}[B_c \times D].
+\end{equation}
+All threads participate in loading both arrays from global memory. The loads are naturally contiguous along the head-dimension axis, so cooperative access can be coalesced when the underlying tensor is contiguous, which the C++ binding enforces. After the load, the block executes \texttt{\_\_syncthreads()} so that all four warps may safely read the tile.
+
+The sequence of events inside one key tile is therefore:
+\begin{enumerate}
+  \item cooperative global-memory load of K and V into shared memory;
+  \item block barrier;
+  \item warp-local score computation, online update, and value accumulation;
+  \item block barrier before shared-memory overwrite.
+\end{enumerate}
+
+Inactive tail warps must still participate in both barriers. Returning early would risk a block-wide deadlock, because another warp could still depend on the staged tile \citep{nvidia2026programming}.
+
+\section{Warp reductions and scalar state}
+
+For one key row $j$, each lane computes a partial dot product between its local query elements and the corresponding shared-memory key elements. A sequence of warp shuffles reduces those partial sums to the full scalar score
+\begin{equation}
+  s_{ij} = \alpha\, q_i k_j^{\mathsf T}.
+\end{equation}
+The implementation uses a classic tree reduction over offsets 16, 8, 4, 2, and 1. Warp shuffles avoid allocating shared memory for the reduction and eliminate a block-wide barrier for each score \citep{nvidia2026programming}.
+
+Only lane zero updates the scalar online-softmax state $(m_i,\ell_i)$. It computes the old and new rescaling weights and broadcasts them to the rest of the warp. Every lane then rescales its own slice of the vector numerator. This split is efficient because the scalar state would otherwise be redundantly recomputed by every lane.
+
+\section{Causal control flow}
+
+For causal attention, query row $i$ may use only keys $j\le i$. The kernel expresses this condition as a cheap branch:
+\begin{equation}
+  \text{if causal and } j > i \text{, skip the score.}
+\end{equation}
+This decision has two benefits. First, it avoids explicitly forming masked scores with value $-\infty$. Second, it removes unnecessary exponentials and value updates. The branch is uniform for all lanes in the warp because the owned query row index is shared across the warp.
+
+The implementation deliberately restricts causal mode to $N_q=N_k$. That choice keeps the semantics unambiguous and matches the common self-attention interpretation. Non-causal mode supports rectangular cross-attention and therefore exercises distinct query and key loop bounds.
+
+\section{Backward launch partition}
+
+Backward propagation uses two main kernels after a scalar prepass:
+\begin{enumerate}
+  \item a delta kernel computes $\delta_i = dO_i \cdot O_i$ for every query row;
+  \item a query-major kernel computes $dQ$;
+  \item a key-major kernel computes $dK$ and $dV$.
+\end{enumerate}
+
+The key design choice is ownership. In the query-major kernel, one warp owns one $dQ_i$ row and streams over all key/value tiles. In the key-major kernel, one warp owns one key row $j$ and streams over query and gradient-output tiles. This partitioning removes the need for global atomic additions in the gradient outputs. Atomic-free accumulation is especially valuable for an educational implementation because it makes the result less dependent on execution order and easier to reason about.
+
+\section{Occupancy and resource trade-offs}
+
+No kernel parameter exists in isolation. Shared-memory footprint, register count, occupancy, and instruction throughput interact \citep{volkov2010occupancy}. Increasing the tile height $B_c$ would increase data reuse but also raise shared-memory demand. Increasing the number of owned rows per block would improve tile reuse further, but it would also add more row-local state and therefore more registers per thread.
+
+This repository fixes a conservative point in that design space:
+\begin{itemize}
+  \item small enough to keep the code auditable;
+  \item large enough to demonstrate cooperative K/V reuse;
+  \item numerically stable through FP32 shared tiles and accumulators;
+  \item not tuned for each GPU generation, head dimension, or dtype.
+\end{itemize}
+
+The resulting performance should therefore be interpreted as that of an intentionally readable kernel, not as a search over the best tile schedule that the hardware could support.
+
+\section{Host boundary, streams, and safety}
+
+The C++ binding checks all native preconditions with \texttt{TORCH\_CHECK}: rank, contiguity, layout, dtype, device agreement, non-empty dimensions, head-dimension limits, and causal shape constraints. This boundary matters because undefined or silently coerced inputs can make low-level CUDA behavior extremely hard to diagnose.
+
+The launcher uses PyTorch's active device and current stream rather than assuming the CUDA default stream \citep{pytorch212cuda}. Stream correctness is not cosmetic. A kernel that accidentally launches on the wrong stream may appear correct in isolation and fail only when composed with a larger asynchronous workload. The test suite therefore includes a non-default-stream case as a direct regression guard.
+
+\section{Implication for profiling}
+
+Because the kernel uses scalar arithmetic and explicit synchronization, several profiler outcomes are plausible before measurements are run:
+\begin{enumerate}
+  \item reduced allocator memory relative to materialized attention;
+  \item lower HBM traffic for score/probability intermediates;
+  \item possible occupancy limits from registers or shared memory;
+  \item arithmetic bottlenecks compared with tensor-core SDPA backends;
+  \item branch and synchronization overhead that grows with small problem sizes.
+\end{enumerate}
+
+The benchmark and report template are organized to test these explanations rather than merely to report elapsed time. Nsight Compute and Compute Sanitizer are therefore part of the reproducibility plan even though their artifacts are not yet present in this authoring environment \citep{nvidia2026nsight,nvidia2026sanitizer}.

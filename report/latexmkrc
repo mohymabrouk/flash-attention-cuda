@@ -1,0 +1,7 @@
+$pdf_mode = 1;
+$pdflatex = 'pdflatex -interaction=nonstopmode -halt-on-error -file-line-error %O %S';
+$bibtex = 'bibtex %O %B';
+$max_repeat = 5;
+$out_dir = 'build';
+$aux_dir = 'build';
+$clean_ext = 'acn acr alg glg glo gls ist loa lol nlo nls run.xml synctex.gz';

@@ -1,0 +1,128 @@
+\chapter{Online Softmax as a Streaming Invariant}
+\label{chap:online-softmax}
+
+\section{Why softmax appears to resist tiling}
+
+Matrix multiplication tiles naturally because partial products may be summed in any associative grouping. Softmax is less forgiving. The normalized probability
+\begin{equation}
+  p_{ij} = \frac{e^{s_{ij}}}{\sum_{t\in\mathcal V_i} e^{s_{it}}}
+\end{equation}
+depends on a denominator that is global to row $i$. A blockwise implementation that evaluates only one score tile at a time must therefore answer a precise question: what is the smallest state that can summarize the already processed keys so that a later tile can be merged exactly?
+
+The usual stable-softmax identity already suggests the answer. For any finite row vector $x$,
+\begin{equation}
+  \softmax(x)_j
+  = \frac{e^{x_j-m}}{\sum_t e^{x_t-m}},
+  \qquad
+  m = \max_t x_t.
+  \label{eq:stable-softmax}
+\end{equation}
+Subtracting $m$ does not change the normalized result, but it prevents positive overflow in the exponentials. The obstacle is that a streaming kernel does not know the final row maximum when it starts on the first tile. The maximum itself must therefore become part of the carried state.
+
+\section{Scalar online normalization}
+
+\citet{milakov2018online} show that the normalization for a softmax row can be updated online. Suppose a query row has processed a valid prefix $J$ of keys and define
+\begin{equation}
+  m_J = \max_{j\in J} s_{ij},
+  \qquad
+  \ell_J = \sum_{j\in J} e^{s_{ij}-m_J}.
+\end{equation}
+When a new valid score $x$ arrives, the updated statistics are
+\begin{align}
+  m' &= \max(m_J, x), \\
+  \ell' &= e^{m_J-m'} \ell_J + e^{x-m'}.
+  \label{eq:scalar-online}
+\end{align}
+The first term rescales the old denominator from the old reference maximum $m_J$ to the new reference maximum $m'$. The second term adds the new contribution under the same reference. This recurrence is exact in real arithmetic and numerically stable in floating point because both exponentials have non-positive arguments.
+
+The custom CUDA forward kernel uses the recurrence one valid key row at a time rather than one tile at a time. That choice avoids an inner tile reduction for the maximum and denominator. It also makes the causal case straightforward: invalid future keys are skipped, so they never enter the recurrence as $-\infty$ placeholders.
+
+\section{Vector-valued sufficient state}
+
+Attention requires more than the scalar normalizer. The output row
+\begin{equation}
+  o_i = \sum_{j\in\mathcal V_i} p_{ij} v_j
+\end{equation}
+may be rewritten as a ratio between a vector numerator and the scalar denominator. Define
+\begin{equation}
+  A_J = \sum_{j\in J} e^{s_{ij}-m_J} v_j \in \R^D.
+\end{equation}
+The triplet $(m_J,\ell_J,A_J)$ is sufficient to recover the exact partial attention result for the processed keys:
+\begin{equation}
+  o_i^{(J)} = \frac{A_J}{\ell_J}.
+\end{equation}
+If a new valid score-value pair $(x,v)$ arrives, the update becomes
+\begin{align}
+  m' &= \max(m_J, x), \\
+  \ell' &= e^{m_J-m'} \ell_J + e^{x-m'}, \\
+  A' &= e^{m_J-m'} A_J + e^{x-m'} v.
+  \label{eq:vector-online}
+\end{align}
+The scalar and vector updates share the same rescaling factor. In implementation terms, each lane of a warp owns a slice of $A_J$, while lane zero owns the scalar $(m_J,\ell_J)$ and broadcasts the rescaling coefficients to the rest of the warp.
+
+\begin{invariant}[Streaming attention state]
+For any non-empty processed key set $J \subseteq \mathcal V_i$, let
+\begin{equation*}
+  m_J = \max_{j\in J} s_{ij},\quad
+  \ell_J = \sum_{j\in J} e^{s_{ij}-m_J},\quad
+  A_J = \sum_{j\in J} e^{s_{ij}-m_J} v_j.
+\end{equation*}
+After any sequence of updates of the form \eqref{eq:vector-online}, the maintained state equals $(m_J,\ell_J,A_J)$ for the set of keys processed so far.
+\end{invariant}
+
+\begin{proof}
+The empty state is represented by $m=-\infty$, $\ell=0$, and $A=0$. The first valid element is treated as a special case: the implementation writes $m=x$, $\ell=1$, and $A=v$. This equals the invariant for $J=\{j\}$.
+
+Assume the invariant holds for a processed set $J$ and a new valid key $u\notin J$ with score $x=s_{iu}$ is added. Let $m'=\max(m_J,x)$. For every old element $j\in J$,
+\begin{equation}
+  e^{s_{ij}-m'} = e^{s_{ij}-m_J} e^{m_J-m'}.
+\end{equation}
+Multiplying the old sums by $e^{m_J-m'}$ therefore changes only the common reference maximum, not the represented values. Adding the new contribution under the same reference yields
+\begin{align}
+  \ell' &= \sum_{j\in J} e^{s_{ij}-m'} + e^{x-m'}
+        = \sum_{j\in J\cup\{u\}} e^{s_{ij}-m'}, \\
+  A' &= \sum_{j\in J} e^{s_{ij}-m'} v_j + e^{x-m'} v_u
+      = \sum_{j\in J\cup\{u\}} e^{s_{ij}-m'} v_j.
+\end{align}
+Hence the invariant holds for $J\cup\{u\}$. Induction proves the claim.
+\end{proof}
+
+\section{Tile merges and exactness}
+
+The proof above is agnostic to how the key set is partitioned. One may process scores one at a time, tile by tile, or merge independently reduced subproblems so long as each merge applies the same rescaling logic. This is what makes the algorithm both exact and parallelizable. The tile size affects only the schedule and hardware behavior, not the mathematical output in real arithmetic.
+
+This distinction is important because the word ``online'' sometimes suggests approximation. That is not the case here. The result differs from materialized attention only through floating-point effects that are unavoidable whenever operations are regrouped. \citet{goldberg1991floating} and \citet{higham2002accuracy} make the general point: floating-point arithmetic is not associative, so any parallel reduction scheme may change low-order bits even when it computes the same real-valued expression.
+
+\section{Finite-precision behavior}
+
+The implementation uses FP32 for the online state even when the input and output tensors are FP16 or BF16. This is a deliberate numerical design choice.
+
+\begin{enumerate}
+  \item The maximum $m_i$ should be represented in a format with enough exponent range to avoid turning a valid rescaling factor into zero or infinity unnecessarily.
+  \item The denominator $\ell_i$ accumulates many positive terms. FP32 reduces the risk that repeated additions of small terms into a large running sum disappear too early.
+  \item The numerator $A_i$ inherits all the conditioning issues of both the probabilities and the values. Accumulating it in FP16 would introduce rounding at every tile update rather than only at the final store.
+\end{enumerate}
+
+The result is still not bitwise identical to every framework backend. Different reduction orders, different handling of fused operations, and hardware-specific implementations of `expf` can change the last bits \citep{ieee7542019,pytorch212numerics}. For this reason the test suite uses justified tolerances rather than exact equality for low-precision CUDA cases.
+
+\section{Implementation consequence for the forward kernel}
+
+The invariant drives the structure of the forward kernel directly:
+\begin{enumerate}
+  \item each warp loads one query row into registers;
+  \item the block stages a key tile and a value tile in shared memory;
+  \item the warp computes one score at a time for the valid rows in the tile;
+  \item lane zero updates $(m_i,\ell_i)$ and broadcasts the rescaling factors;
+  \item every lane rescales its slice of $A_i$ and adds the weighted value slice;
+  \item after the final tile, the warp writes $o_i = A_i/\ell_i$ and $L_i = m_i + \log \ell_i$.
+\end{enumerate}
+
+The saved statistic $L_i$ is not merely an implementation convenience. It is the row log-sum-exp,
+\begin{equation}
+  L_i = \log \sum_{j\in\mathcal V_i} e^{s_{ij}},
+\end{equation}
+and therefore the exact scalar needed to reconstruct probabilities during the backward pass:
+\begin{equation}
+  p_{ij} = e^{s_{ij} - L_i}.
+\end{equation}
+The next chapter uses this fact to connect the invariant to the larger IO-aware FlashAttention schedule of \citet{dao2022flashattention}.

@@ -1,0 +1,73 @@
+\begin{titlepage}
+  \centering
+  \vspace*{18mm}
+  {\Huge\bfseries An Educational FlashAttention-Style\\[2mm] CUDA Operator\par}
+  \vspace{7mm}
+  {\Large Exact Online Softmax, IO-Aware Tiling, and\\First-Order Backpropagation from Scratch\par}
+  \vspace{16mm}
+  \begin{tikzpicture}[x=1cm,y=1cm]
+    \node[draw=DeepBlue,fill=SoftBlue,rounded corners,minimum width=3.0cm,minimum height=1.1cm] (q) at (0,0) {$Q$ tile};
+    \node[draw=DeepGreen,fill=SoftGreen,rounded corners,minimum width=3.0cm,minimum height=1.1cm] (kv) at (4.0,0) {$K,V$ tile};
+    \node[draw=DeepOrange,fill=SoftOrange,rounded corners,minimum width=4.0cm,minimum height=1.1cm] (state) at (2.0,-2.0) {online state $(m,\ell,A)$};
+    \node[draw=DeepBlue,fill=white,rounded corners,minimum width=3.0cm,minimum height=1.1cm] (out) at (2.0,-4.0) {$O=A/\ell$};
+    \draw[-{Latex[length=3mm]},thick,DeepBlue] (q) -- (state);
+    \draw[-{Latex[length=3mm]},thick,DeepGreen] (kv) -- (state);
+    \draw[-{Latex[length=3mm]},thick,DeepOrange] (state) -- node[right,align=left,font=\small]{rescale and\\accumulate} (out);
+  \end{tikzpicture}
+  \vfill
+  {\large Technical report and reproducible experiment template\par}
+  \vspace{3mm}
+  {\large FlashAttention CUDA From Scratch Project\par}
+  \vspace{5mm}
+  {\normalsize Report revision: July 2026\par}
+\end{titlepage}
+
+\chapter*{Abstract}
+\addcontentsline{toc}{chapter}{Abstract}
+
+Scaled dot-product attention is arithmetically simple but difficult to implement efficiently. A conventional implementation materializes an $N_q\times N_k$ score matrix, normalizes it, and materializes the probability matrix before multiplying by values. Those intermediates have quadratic size and cause repeated traffic through off-chip memory. 
+\FA{} reorganizes the same exact computation around the memory hierarchy: it tiles keys and values through on-chip storage, evaluates softmax online, and retains only a small state for each query row. This report develops those ideas from first principles and documents an educational PyTorch/CUDA implementation with a complete first-order backward pass.
+
+The operator accepts contiguous CUDA tensors $Q\in\R^{B\times H\times N_q\times D}$ and $K,V\in\R^{B\times H\times N_k\times D}$ in FP16, BF16, or FP32, with $1\leq D\leq256$. It supports rectangular non-causal attention and square causal self-attention. The forward kernel launches four warps per thread block, assigns one query row to each warp, and streams key/value tiles of 16 rows through FP32 shared memory. It maintains the running maximum, exponential denominator, and value numerator in FP32. The backward path does not save the probability matrix. Instead, it stores the forward log-sum-exp statistic, computes the rowwise contraction $\delta_i=dO_i\cdot O_i$, and recomputes probabilities in separate query-major and key-major kernels. These kernels write $dQ$ and $(dK,dV)$ without atomics.
+
+The mathematical treatment proves the online-softmax invariant and derives the vector-valued merge rule used by the kernel. It then derives the complete reverse-mode equations, explains why the scalar $\delta_i$ is sufficient for the softmax Jacobian, and distinguishes recomputation from approximation. The systems treatment maps those equations onto warps, registers, shared memory, and global memory; calculates the exact shared-memory footprint $128D$ bytes per forward or gradient block; and discusses synchronization, tail handling, memory coalescing, launch geometry, and numerical behavior. The evaluation chapter defines falsifiable correctness and performance protocols, but intentionally reports no GPU claims before a controlled run. Visible placeholders are connected to future generated CSV/JSON artifacts so that absent measurements cannot be mistaken for evidence.
+
+This implementation is not the production FA{} library. It deliberately excludes dropout, arbitrary masks and biases, grouped-query attention, tensor-core matrix instructions, second-order gradients, and architecture-specific asynchronous pipelines. Its contribution is an inspectable end-to-end realization of the central IO-aware algorithm, including first-order training gradients, together with a disciplined framework for measuring what the implementation actually achieves.
+
+\chapter*{Reader's guide and evidence policy}
+\addcontentsline{toc}{chapter}{Reader's guide and evidence policy}
+
+The report separates three kinds of statement. A \emph{mathematical claim} follows from stated equations and is accompanied by a derivation or citation. An \emph{implementation claim} describes the source-level contract and launch structure and must be checkable against the repository. An \emph{empirical claim} requires an archived result artifact produced on named hardware and software. The first two kinds are developed now. The third remains explicitly pending until the project is executed on a CUDA-capable Kaggle session or another recorded machine.
+
+Chapters~\ref{chap:background}--\ref{chap:flash} develop attention, the GPU memory hierarchy, online softmax, and tiled exact attention. Chapters~\ref{chap:cuda-design}--\ref{chap:backward} specify the native interface and forward/backward kernels. Chapters~\ref{chap:correctness}--\ref{chap:results} define validation, experimental methodology, and data-driven result hooks. The remaining chapters interpret what the eventual evidence can and cannot establish. Appendices provide expanded derivations, a reproducibility checklist, and machine-readable result schemas.
+
+\begin{scopebox}
+The term \emph{FlashAttention-style} in this report means an exact attention computation that avoids materializing the quadratic score/probability matrices by combining tiling with online normalization and backward recomputation. It does not imply API, feature, or performance parity with the production FlashAttention releases of \citet{dao2022flashattention,dao2024flashattention2,shah2024flashattention3}.
+\end{scopebox}
+
+\begin{table}[htbp]
+\centering
+\caption{Principal symbols used throughout the report. Batch and head indices are usually suppressed after flattening them into one independent problem.}
+\label{tab:notation}
+\begin{tabularx}{\textwidth}{@{}l l X@{}}
+\toprule
+Symbol & Shape or domain & Meaning \\
+\midrule
+$B,H$ & positive integers & batch size and number of attention heads \\
+$N_q,N_k$ & positive integers & query and key/value sequence lengths \\
+$D$ & $1\leq D\leq256$ & query/key head dimension and value dimension in this implementation \\
+$Q,K,V$ & $N_q\!\times D$, $N_k\!\times D$, $N_k\!\times D$ & one batch-head slice of the input tensors \\
+$\alpha$ & positive scalar & score scale; default convention is $D^{-1/2}$ \\
+$S$ & $N_q\times N_k$ & scaled and, if causal, masked scores \\
+$P$ & $N_q\times N_k$ & rowwise softmax probabilities \\
+$O$ & $N_q\times D$ & attention output $PV$ \\
+$m_i,\ell_i$ & scalars per query row & online maximum and rescaled exponential sum \\
+$A_i$ & $\R^D$ & unnormalized online value numerator \\
+$L_i$ & scalar per query row & log-sum-exp $m_i+\log\ell_i$ saved for backward \\
+$G$ or $dO$ & $N_q\times D$ & upstream derivative of the scalar loss with respect to $O$ \\
+$\delta_i$ & scalar per query row & contraction $dO_i\cdot O_i$ used in the softmax gradient \\
+$M$ & element capacity & abstract fast-memory capacity in IO-complexity analysis \\
+$B_c$ & 16 & key/value or query tile length in the native kernels \\
+\bottomrule
+\end{tabularx}
+\end{table}
